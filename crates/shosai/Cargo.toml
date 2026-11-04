@@ -1,0 +1,23 @@
+[package]
+name = "shosai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+shosai-core = { path = "../shosai-core", default-features = false }
+eframe = { version = "0.37", default-features = false, features = ["glow", "x11", "wayland", "clipboard", "links", "default_fonts", "system_fonts", "persistence"] }
+egui_commonmark = { version = "0.26", default-features = false, features = ["pulldown_cmark", "load-images", "svg"] }
+egui_extras = { version = "0.37", default-features = false, features = ["image", "file"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+serde = { version = "1", features = ["derive"] }
+rfd = "0.15"
+
+[features]
+default = ["pdf"]
+# 內嵌 Typst PDF 引擎（關閉可縮小執行檔，改用系統的 typst 指令）
+pdf = ["shosai-core/pdf"]
+# 內嵌 Typst 字型（+約 10MB，適合沒有字型的伺服器 / 容器）
+bundled-fonts = ["pdf", "shosai-core/bundled-fonts"]
+# Nextcloud / WebDAV 同步（實驗性）
+nextcloud = ["shosai-core/nextcloud"]

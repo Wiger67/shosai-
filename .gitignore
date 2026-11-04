@@ -1,0 +1,6 @@
+/target
+*.pdf
+!examples/**/*.pdf
+.shosai/
+.shosai-trash/
+*.shosai-tmp

@@ -1,0 +1,15 @@
+title = "書齋使用手冊"
+subtitle = "用 Markdown 寫一本書"
+author = "書齋 Shosai"
+language = "zh-TW"
+chapters = ["01-開始.md", "02-語法展示.md", "03-排版與輸出.md"]
+
+[layout]
+paper = "a5"
+font_size = 10.5
+line_height = 1.8
+indent = true
+numbered = true
+cover = true
+toc = true
+toc_depth = 2

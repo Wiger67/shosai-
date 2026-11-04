@@ -1,0 +1,23 @@
+[package]
+name = "shosai-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["pdf"]
+pdf = ["dep:typst", "dep:typst-pdf", "dep:typst-kit", "dep:typst-layout"]
+# 把 Typst 內建字型（Libertinus、New Computer Modern、DejaVu Sans Mono，約 10MB）編進執行檔。
+# 未啟用時使用系統字型。
+bundled-fonts = ["pdf", "typst-kit/embedded-fonts"]
+nextcloud = ["dep:ureq"]
+
+[dependencies]
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+serde = { version = "1", features = ["derive"] }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde", "display"] }
+typst = { version = "0.15", optional = true }
+typst-pdf = { version = "0.15", optional = true }
+typst-layout = { version = "0.15", optional = true }
+typst-kit = { version = "0.15", optional = true, features = ["scan-fonts"] }
+ureq = { version = "3", optional = true }
