@@ -2,7 +2,7 @@ title = "書齋使用手冊"
 subtitle = "用 Markdown 寫一本書"
 author = "書齋 Shosai"
 language = "zh-TW"
-chapters = ["01-開始.md", "02-語法展示.md", "03-排版與輸出.md"]
+chapters = ["01-開始.md", "02-語法展示.md", "03-HackMD與數學式.md", "04-排版與輸出.md"]
 
 [layout]
 paper = "a5"

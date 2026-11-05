@@ -1,13 +1,12 @@
 //! Markdown → Typst 轉換，並套用「書本」版型。
 
-use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use pulldown_cmark::{Alignment, CodeBlockKind, Event, Parser, Tag, TagEnd};
-
 use super::{resolve_local_image, Document};
-use crate::markdown::{is_cjk, level_num, options};
+use crate::hmd::{self, Align, Block, ContainerKind, Inline, MdDoc};
+use crate::markdown::is_cjk;
+use crate::math;
 
 /// 轉換結果：Typst 原始碼 + 需要的圖片（虛擬路徑 → 實際檔案）。
 #[derive(Debug, Clone, Default)]
@@ -22,9 +21,9 @@ pub fn render(doc: &Document) -> TypstOutput {
     let mut src = preamble(doc);
 
     for ch in &doc.chapters {
-        let body = markdown_to_typst(&ch.markdown, &ch.base_dir, &mut images);
-        let starts_with_h1 = crate::markdown::outline(&ch.markdown).first().is_some_and(|h| h.level == 1);
-        if doc.is_book && !starts_with_h1 {
+        let md = hmd::parse(&ch.markdown);
+        let body = doc_to_typst(&md, &ch.base_dir, &mut images);
+        if doc.is_book && !md.starts_with_h1() {
             let _ = writeln!(src, "= {}\n", escape_markup(&ch.title));
         }
         src.push_str(&body);
@@ -43,6 +42,7 @@ fn preamble(doc: &Document) -> String {
     let spacing = if l.indent { leading } else { leading + 0.5 };
 
     let _ = writeln!(s, "// 由 書齋 shosai 自動產生");
+    s.push_str(math::MITEX_IMPORT);
     let _ = writeln!(
         s,
         "#set document(title: {}{})",
@@ -128,10 +128,41 @@ const TEMPLATE_COMMON: &str = r##"#show raw: set text(font: ("DejaVu Sans Mono",
 #show heading.where(level: 2): set text(size: 1.25em)
 #show heading.where(level: 3): set text(size: 1.1em)
 #show footnote.entry: set par(first-line-indent: 0em)
-#let md-image(path, alt: none) = layout(size => {
-  let img = image(path, alt: alt)
+#let md-image(path, alt: none, width: auto) = layout(size => {
+  let img = image(path, alt: alt, width: width)
   if measure(img).width > size.width { image(path, width: 100%, alt: alt) } else { img }
 })
+#let md-code(body, start: none) = {
+  if start == none { body } else {
+    show raw.line: it => box(width: 2.4em, align(right, text(fill: luma(150), str(it.number + start - 1)))) + h(0.9em) + it.body
+    body
+  }
+}
+#let md-box-colors = (
+  info: (rgb("#d9edf7"), rgb("#bce8f1"), rgb("#31708f")),
+  success: (rgb("#dff0d8"), rgb("#d6e9c6"), rgb("#3c763d")),
+  warning: (rgb("#fcf8e3"), rgb("#faebcc"), rgb("#8a6d3b")),
+  danger: (rgb("#f2dede"), rgb("#ebccd1"), rgb("#a94442")),
+)
+#let md-box(kind, title: none, body) = {
+  let (bg, border, fg) = md-box-colors.at(kind)
+  block(fill: bg, stroke: 0.6pt + border, inset: (x: 11pt, y: 9pt), radius: 3pt, width: 100%, breakable: true, {
+    set par(first-line-indent: 0em)
+    set text(fill: fg)
+    if title != none { block(below: 0.7em, text(weight: "bold", title)) }
+    body
+  })
+}
+#let md-spoiler(title, body) = block(stroke: 0.6pt + luma(200), inset: (x: 11pt, y: 9pt), radius: 3pt, width: 100%, {
+  set par(first-line-indent: 0em)
+  block(below: 0.7em, text(weight: "bold")[▸ #title])
+  body
+})
+#let md-toc(entries) = block(inset: (y: 0.3em), {
+  set par(first-line-indent: 0em)
+  for (level, body) in entries { block(above: 0.45em, below: 0.45em, pad(left: (level - 1) * 1.2em, body)) }
+})
+#show math.equation: set text(font: ("New Computer Modern Math", "STIX Two Math", "Cambria Math"))
 #let md-check(done) = box(width: 0.8em, height: 0.8em, baseline: 0.1em, stroke: 0.6pt + luma(80), radius: 1.5pt, fill: if done { luma(90) } else { none })
 "##;
 
@@ -214,377 +245,294 @@ pub fn escape_markup(s: &str) -> String {
     out
 }
 
-/// 將一段 Markdown 轉成 Typst 標記。
+/// 將一段 Markdown（HackMD 語法）轉成 Typst 標記。
 pub fn markdown_to_typst(md: &str, base_dir: &Path, images: &mut Vec<(String, PathBuf)>) -> String {
-    let events: Vec<Event> = Parser::new_ext(md, options()).collect();
-
-    // 先把註腳定義抽出來，引用處再以 #footnote[...] 內嵌
-    let mut footnotes = HashMap::new();
-    let mut body = Vec::with_capacity(events.len());
-    let mut iter = events.into_iter();
-    while let Some(ev) = iter.next() {
-        if let Event::Start(Tag::FootnoteDefinition(label)) = ev {
-            let mut inner = Vec::new();
-            for e in iter.by_ref() {
-                if matches!(e, Event::End(TagEnd::FootnoteDefinition)) {
-                    break;
-                }
-                inner.push(e);
-            }
-            let mut sub = Converter::new(base_dir, images, HashMap::new());
-            sub.run(inner);
-            footnotes.insert(label.to_string(), sub.out.trim().to_string());
-        } else {
-            body.push(ev);
-        }
-    }
-
-    let mut conv = Converter::new(base_dir, images, footnotes);
-    conv.run(body);
-    conv.out
+    doc_to_typst(&hmd::parse(md), base_dir, images)
 }
 
-struct Converter<'a> {
-    out: String,
+/// 將已解析的文件轉成 Typst 標記。
+pub fn doc_to_typst(doc: &MdDoc, base_dir: &Path, images: &mut Vec<(String, PathBuf)>) -> String {
+    let mut r = Renderer { doc, base_dir, images, out: String::new(), in_heading: false };
+    r.blocks(&doc.blocks);
+    r.out
+}
+
+struct Renderer<'a> {
+    doc: &'a MdDoc,
     base_dir: &'a Path,
     images: &'a mut Vec<(String, PathBuf)>,
-    footnotes: HashMap<String, String>,
-    pending_soft: bool,
-    /// 程式碼區塊內容（收集中時為 Some）
-    code: Option<(String, String)>,
-    /// 圖片替代文字（收集中時為 Some）
-    image: Option<(Option<String>, String)>,
-    /// 目前段落起點，以及段落是否只有一張圖
-    para: Option<(usize, ParaContent)>,
+    out: String,
     in_heading: bool,
-    in_table_head: bool,
 }
 
-#[derive(Clone, PartialEq)]
-enum ParaContent {
-    Empty,
-    OnlyImage(String, String),
-    Mixed,
-}
+impl Renderer<'_> {
+    /// 在獨立緩衝區中渲染（用於清單項目、註腳等），回傳結果。
+    fn capture(&mut self, f: impl FnOnce(&mut Self)) -> String {
+        let saved = std::mem::take(&mut self.out);
+        f(self);
+        let inner = std::mem::replace(&mut self.out, saved);
+        inner.trim().to_string()
+    }
 
-impl<'a> Converter<'a> {
-    fn new(base_dir: &'a Path, images: &'a mut Vec<(String, PathBuf)>, footnotes: HashMap<String, String>) -> Self {
-        Converter {
-            out: String::new(),
-            base_dir,
-            images,
-            footnotes,
-            pending_soft: false,
-            code: None,
-            image: None,
-            para: None,
-            in_heading: false,
-            in_table_head: false,
+    fn blocks(&mut self, blocks: &[Block]) {
+        for b in blocks {
+            self.block(b);
         }
     }
 
-    fn run(&mut self, events: Vec<Event>) {
-        for ev in events {
-            self.event(ev);
-        }
-    }
-
-    fn mark_mixed(&mut self) {
-        if let Some((_, content)) = self.para.as_mut() {
-            *content = ParaContent::Mixed;
-        }
-    }
-
-    /// 輸出 Typst 語法片段（非純文字）。
-    fn raw(&mut self, s: &str) {
-        self.flush_soft(None);
-        self.out.push_str(s);
-    }
-
-    fn flush_soft(&mut self, next: Option<char>) {
-        if !self.pending_soft {
-            return;
-        }
-        self.pending_soft = false;
-        let prev = self.out.chars().last();
-        let both_cjk = prev.is_some_and(is_cjk) && next.is_some_and(is_cjk);
-        if !both_cjk {
-            self.out.push(' ');
-        }
-    }
-
-    fn text(&mut self, t: &str) {
-        if t.is_empty() {
-            return;
-        }
-        if !t.trim().is_empty() {
-            self.mark_mixed();
-        }
-        self.flush_soft(t.chars().next());
-        self.out.push_str(&escape_markup(t));
-    }
-
-    fn block_end(&mut self) {
-        self.pending_soft = false;
-        if self.in_heading {
-            return;
-        }
+    fn end_block(&mut self) {
         while self.out.ends_with(' ') {
             self.out.pop();
         }
         self.out.push_str("\n\n");
     }
 
-    fn event(&mut self, ev: Event) {
-        // 收集程式碼區塊
-        if let Some((_, code)) = self.code.as_mut() {
-            match ev {
-                Event::Text(t) => code.push_str(&t),
-                Event::End(TagEnd::CodeBlock) => {
-                    let (lang, code) = self.code.take().unwrap();
-                    let code = code.strip_suffix('\n').unwrap_or(&code).to_string();
-                    let lang = if lang.is_empty() { String::new() } else { format!(", lang: {}", typst_str(&lang)) };
-                    let s = format!("#raw({}, block: true{lang})", typst_str(&code));
-                    self.raw(&s);
-                    self.block_end();
-                }
-                _ => {}
-            }
-            return;
-        }
-        // 收集圖片替代文字
-        if let Some((_, alt)) = self.image.as_mut() {
-            match ev {
-                Event::Text(t) | Event::Code(t) => alt.push_str(&t),
-                Event::End(TagEnd::Image) => self.finish_image(),
-                _ => {}
-            }
-            return;
-        }
-
-        match ev {
-            Event::Start(tag) => self.start(tag),
-            Event::End(tag) => self.end(tag),
-            Event::Text(t) => self.text(&t),
-            Event::Code(t) => {
-                self.mark_mixed();
-                let s = format!("#raw({})", typst_str(&t));
-                self.raw(&s);
-            }
-            Event::InlineMath(t) => {
-                let s = format!("#raw({})", typst_str(&t));
-                self.raw(&s);
-            }
-            Event::DisplayMath(t) => {
-                let s = format!("#raw({}, block: true)", typst_str(&t));
-                self.raw(&s);
-            }
-            Event::Html(h) | Event::InlineHtml(h) => self.html(&h),
-            Event::FootnoteReference(label) => {
-                self.mark_mixed();
-                let s = match self.footnotes.get(label.as_ref()) {
-                    Some(content) => format!("#footnote[{content}]"),
-                    None => format!("#super[{}]", escape_markup(&label)),
-                };
-                self.raw(&s);
-            }
-            Event::SoftBreak => self.pending_soft = true,
-            Event::HardBreak => {
-                if self.in_heading {
-                    self.raw(" ");
+    fn block(&mut self, b: &Block) {
+        match b {
+            Block::Paragraph(inl) => {
+                if let Some(fig) = self.figure(inl) {
+                    self.out.push_str(&fig);
                 } else {
-                    self.raw(" \\\n");
+                    self.inlines(inl);
                 }
+                self.end_block();
             }
-            Event::Rule => {
-                self.raw("#align(center, line(length: 40%, stroke: 0.5pt + luma(150)))");
-                self.block_end();
-            }
-            Event::TaskListMarker(done) => self.raw(&format!("#md-check({done}) ")),
-        }
-    }
-
-    fn html(&mut self, h: &str) {
-        let t = h.trim().to_ascii_lowercase();
-        if t.starts_with("<br") {
-            self.raw(" \\\n");
-        } else if t.contains("pagebreak") || t.contains("page-break") || t.contains("break-after: page") {
-            self.raw("#pagebreak()");
-            self.block_end();
-        }
-        // 其他 HTML 不輸出到 PDF
-    }
-
-    fn start(&mut self, tag: Tag) {
-        match tag {
-            Tag::Paragraph => {
-                self.para = Some((self.out.len(), ParaContent::Empty));
-            }
-            Tag::Heading { level, .. } => {
-                self.raw(&format!("{} ", "=".repeat(level_num(level) as usize)));
+            Block::Heading { level, content, .. } => {
+                let _ = write!(self.out, "{} ", "=".repeat(*level as usize));
                 self.in_heading = true;
+                self.inlines(content);
+                self.in_heading = false;
+                self.end_block();
             }
-            Tag::BlockQuote(_) => self.raw("#quote(block: true)["),
-            Tag::CodeBlock(kind) => {
-                let lang = match kind {
-                    CodeBlockKind::Fenced(info) => info.split([' ', ',', '{']).next().unwrap_or("").to_string(),
-                    CodeBlockKind::Indented => String::new(),
-                };
-                self.code = Some((lang, String::new()));
+            Block::Quote(bs) => {
+                let inner = self.capture(|r| r.blocks(bs));
+                let _ = write!(self.out, "#quote(block: true)[{inner}]");
+                self.end_block();
             }
-            Tag::HtmlBlock => {}
-            Tag::List(Some(start)) => self.raw(&format!("#enum(start: {start}, tight: false, ")),
-            Tag::List(None) => self.raw("#list(tight: false, "),
-            Tag::Item => self.raw("["),
-            Tag::Table(aligns) => {
-                let a = aligns
-                    .iter()
-                    .map(|a| match a {
-                        Alignment::None | Alignment::Left => "left",
-                        Alignment::Center => "center",
-                        Alignment::Right => "right",
+            Block::Code { lang, code, line_start } => {
+                let lang = if lang.is_empty() { String::new() } else { format!(", lang: {}", typst_str(lang)) };
+                let start = line_start.map(|n| format!(", start: {n}")).unwrap_or_default();
+                let _ = write!(self.out, "#md-code(raw({}, block: true{lang}){start})", typst_str(code));
+                self.end_block();
+            }
+            Block::Math(tex) => {
+                self.out.push_str(&equation(tex, true));
+                self.end_block();
+            }
+            Block::List { start, items } => {
+                let tight = items.iter().all(|i| i.len() <= 1 || !matches!(i[1], Block::Paragraph(_)));
+                match start {
+                    Some(n) => {
+                        let _ = write!(self.out, "#enum(start: {n}, tight: {tight}, ");
+                    }
+                    None => {
+                        let _ = write!(self.out, "#list(tight: {tight}, ");
+                    }
+                }
+                for item in items {
+                    let inner = self.capture(|r| r.blocks(item));
+                    let _ = write!(self.out, "[{inner}], ");
+                }
+                self.out.push(')');
+                self.end_block();
+            }
+            Block::Table { aligns, header, rows } => {
+                let cols = header.len().max(rows.iter().map(Vec::len).max().unwrap_or(0)).max(1);
+                let a = (0..cols)
+                    .map(|i| match aligns.get(i) {
+                        Some(Align::Center) => "center",
+                        Some(Align::Right) => "right",
+                        _ => "left",
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                self.raw(&format!("#table(columns: {}, align: ({a},),\n", aligns.len().max(1)));
-            }
-            Tag::TableHead => {
-                self.in_table_head = true;
-                self.raw("table.header(");
-            }
-            Tag::TableRow => {}
-            Tag::TableCell => {
-                if self.in_table_head {
-                    self.raw("[*");
-                } else {
-                    self.raw("[");
-                }
-            }
-            Tag::Emphasis => {
-                self.mark_mixed();
-                self.raw("#emph[");
-            }
-            Tag::Strong => {
-                self.mark_mixed();
-                self.raw("#strong[");
-            }
-            Tag::Strikethrough => self.raw("#strike["),
-            Tag::Superscript => self.raw("#super["),
-            Tag::Subscript => self.raw("#sub["),
-            Tag::Link { dest_url, .. } => {
-                self.mark_mixed();
-                let url = dest_url.as_ref();
-                if url.contains("://") || url.starts_with("mailto:") {
-                    self.raw(&format!("#link({})[", typst_str(url)));
-                } else {
-                    // 文件內連結、相對連結：只保留文字
-                    self.raw("#[");
-                }
-            }
-            Tag::Image { dest_url, .. } => {
-                let path = resolve_local_image(self.base_dir, &dest_url).filter(|p| is_supported_image(p));
-                let vpath = path.map(|p| {
-                    if let Some((v, _)) = self.images.iter().find(|(_, real)| *real == p) {
-                        v.clone()
-                    } else {
-                        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("png").to_ascii_lowercase();
-                        let v = format!("/__img/{}.{ext}", self.images.len() + 1);
-                        self.images.push((v.clone(), p));
-                        v
+                let _ = writeln!(self.out, "#table(columns: {cols}, align: ({a},),");
+                if !header.is_empty() {
+                    self.out.push_str("table.header(");
+                    for cell in header {
+                        let c = self.capture(|r| r.inlines(cell));
+                        let _ = write!(self.out, "[*{c}*], ");
                     }
-                });
-                self.image = Some((vpath, String::new()));
+                    self.out.push_str("),\n");
+                }
+                for row in rows {
+                    for i in 0..cols {
+                        let c = row.get(i).map(|cell| self.capture(|r| r.inlines(cell))).unwrap_or_default();
+                        let _ = write!(self.out, "[{c}], ");
+                    }
+                    self.out.push('\n');
+                }
+                self.out.push(')');
+                self.end_block();
             }
-            Tag::FootnoteDefinition(_) | Tag::MetadataBlock(_) => {}
-            Tag::DefinitionList | Tag::DefinitionListTitle | Tag::DefinitionListDefinition => {}
+            Block::Rule => {
+                self.out.push_str("#align(center, line(length: 40%, stroke: 0.5pt + luma(150)))");
+                self.end_block();
+            }
+            Block::Container { kind, title, blocks, .. } => {
+                let inner = self.capture(|r| r.blocks(blocks));
+                let title_c = if title.is_empty() { String::new() } else { escape_markup(title) };
+                match kind {
+                    ContainerKind::Spoiler => {
+                        let t = if title_c.is_empty() { "詳細內容".to_string() } else { title_c };
+                        let _ = write!(self.out, "#md-spoiler([{t}])[{inner}]");
+                    }
+                    k => {
+                        let t = if title.is_empty() { String::new() } else { format!(", title: [{title_c}]") };
+                        let _ = write!(self.out, "#md-box({}{t})[{inner}]", typst_str(k.name()));
+                    }
+                }
+                self.end_block();
+            }
+            Block::DefList(items) => {
+                self.out.push_str("#terms(tight: false, ");
+                for item in items {
+                    let term = self.capture(|r| r.inlines(&item.term));
+                    let defs: Vec<String> = item.defs.iter().map(|d| self.capture(|r| r.blocks(d))).collect();
+                    let _ = write!(self.out, "terms.item[{term}][{}], ", defs.join("\n\n"));
+                }
+                self.out.push(')');
+                self.end_block();
+            }
+            Block::Toc => {
+                let headings = self.doc.headings();
+                if headings.is_empty() {
+                    return;
+                }
+                let min = headings.iter().map(|h| h.level).min().unwrap_or(1);
+                let entries: Vec<String> =
+                    headings.iter().map(|h| format!("({}, [{}])", h.level - min + 1, escape_markup(&h.text))).collect();
+                let _ = write!(self.out, "#md-toc(({},))", entries.join(", "));
+                self.end_block();
+            }
+            Block::PageBreak => {
+                self.out.push_str("#pagebreak()");
+                self.end_block();
+            }
+            Block::Html(_) => {}
         }
     }
 
-    fn finish_image(&mut self) {
-        let Some((vpath, alt)) = self.image.take() else { return };
-        match vpath {
-            Some(v) => {
-                let alt_arg = if alt.is_empty() { String::new() } else { format!(", alt: {}", typst_str(&alt)) };
-                let s = format!("#md-image({}{alt_arg})", typst_str(&v));
-                let was_empty = matches!(self.para, Some((_, ParaContent::Empty)));
-                self.raw(&s);
-                if let Some((_, content)) = self.para.as_mut() {
-                    *content = if was_empty { ParaContent::OnlyImage(v, alt) } else { ParaContent::Mixed };
+    /// 段落中只有一張本機圖片 → 置中圖表，替代文字當圖說。
+    fn figure(&mut self, inl: &[Inline]) -> Option<String> {
+        let mut meaningful = inl.iter().filter(|i| !matches!(i, Inline::Text(t) if t.trim().is_empty()));
+        let (Some(Inline::Image { url, alt, width, .. }), None) = (meaningful.next(), meaningful.next()) else {
+            return None;
+        };
+        let vpath = self.image_path(url)?;
+        let caption = if alt.is_empty() { String::new() } else { format!(", caption: [{}]", escape_markup(alt)) };
+        Some(format!("#figure({}{caption})", image_call(&vpath, alt, *width)))
+    }
+
+    fn image_path(&mut self, url: &str) -> Option<String> {
+        let path = resolve_local_image(self.base_dir, url).filter(|p| is_supported_image(p))?;
+        if let Some((v, _)) = self.images.iter().find(|(_, real)| *real == path) {
+            return Some(v.clone());
+        }
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("png").to_ascii_lowercase();
+        let v = format!("/__img/{}.{ext}", self.images.len() + 1);
+        self.images.push((v.clone(), path));
+        Some(v)
+    }
+
+    fn inlines(&mut self, inl: &[Inline]) {
+        for (i, x) in inl.iter().enumerate() {
+            match x {
+                Inline::SoftBreak => {
+                    // 中文之間的換行不加空白
+                    let prev = self.out.chars().last();
+                    let next = match inl.get(i + 1) {
+                        Some(Inline::Text(t)) => t.chars().next(),
+                        _ => None,
+                    };
+                    if !(prev.is_some_and(is_cjk) && next.is_some_and(is_cjk)) {
+                        self.out.push(' ');
+                    }
                 }
-            }
-            None => {
-                self.mark_mixed();
-                let label = if alt.is_empty() { "圖片".to_string() } else { alt };
-                let s = format!("#text(fill: luma(120))[\\[{}\\]]", escape_markup(&label));
-                self.raw(&s);
+                other => self.inline(other),
             }
         }
     }
 
-    fn end(&mut self, tag: TagEnd) {
-        match tag {
-            TagEnd::Paragraph => {
-                if let Some((start, ParaContent::OnlyImage(v, alt))) = self.para.take() {
-                    // 獨立成段的圖片 → 置中圖表，替代文字當圖說
-                    self.out.truncate(start);
-                    let caption =
-                        if alt.is_empty() { String::new() } else { format!(", caption: [{}]", escape_markup(&alt)) };
-                    let alt_arg = if alt.is_empty() { String::new() } else { format!(", alt: {}", typst_str(&alt)) };
-                    let s = format!("#figure(md-image({}{alt_arg}){caption})", typst_str(&v));
-                    self.raw(&s);
-                }
-                self.para = None;
-                self.block_end();
+    fn wrapped(&mut self, open: &str, children: &[Inline]) {
+        let inner = self.capture_inline(children);
+        let _ = write!(self.out, "{open}[{inner}]");
+    }
+
+    /// 行內內容不可 trim（空白有意義），所以另外處理。
+    fn capture_inline(&mut self, children: &[Inline]) -> String {
+        let saved = std::mem::take(&mut self.out);
+        self.inlines(children);
+        std::mem::replace(&mut self.out, saved)
+    }
+
+    fn inline(&mut self, x: &Inline) {
+        match x {
+            Inline::Text(t) => self.out.push_str(&escape_markup(t)),
+            Inline::Code(t) => {
+                let _ = write!(self.out, "#raw({})", typst_str(t));
             }
-            TagEnd::Heading(_) => {
-                self.in_heading = false;
-                self.pending_soft = false;
-                self.block_end();
-            }
-            TagEnd::BlockQuote(_) => {
-                self.trim_trailing_newlines();
-                self.raw("]");
-                self.block_end();
-            }
-            TagEnd::List(_) => {
-                self.raw(")");
-                self.block_end();
-            }
-            TagEnd::Item => {
-                self.trim_trailing_newlines();
-                self.raw("],\n");
-            }
-            TagEnd::Table => {
-                self.raw(")");
-                self.block_end();
-            }
-            TagEnd::TableHead => {
-                self.in_table_head = false;
-                self.raw("),\n");
-            }
-            TagEnd::TableRow => self.raw("\n"),
-            TagEnd::TableCell => {
-                if self.in_table_head {
-                    self.raw("*], ");
+            Inline::Math { tex, display } => self.out.push_str(&equation(tex, *display)),
+            Inline::Emph(c) => self.wrapped("#emph", c),
+            Inline::Strong(c) => self.wrapped("#strong", c),
+            Inline::Strike(c) => self.wrapped("#strike", c),
+            Inline::Mark(c) => self.wrapped("#highlight(fill: rgb(\"#fff3a3\"))", c),
+            Inline::Ins(c) => self.wrapped("#underline", c),
+            Inline::Sup(c) => self.wrapped("#super", c),
+            Inline::Sub(c) => self.wrapped("#sub", c),
+            Inline::Link { url, children, .. } => {
+                if url.contains("://") || url.starts_with("mailto:") {
+                    self.wrapped(&format!("#link({})", typst_str(url)), children);
                 } else {
-                    self.raw("], ");
+                    self.wrapped("#", children);
                 }
             }
-            TagEnd::Emphasis
-            | TagEnd::Strong
-            | TagEnd::Strikethrough
-            | TagEnd::Superscript
-            | TagEnd::Subscript
-            | TagEnd::Link => self.raw("]"),
-            _ => {}
+            Inline::Image { url, alt, width, .. } => match self.image_path(url) {
+                Some(v) => self.out.push_str(&format!("#box({})", image_call(&v, alt, *width))),
+                None => {
+                    let label = if alt.is_empty() { "圖片" } else { alt };
+                    let _ = write!(self.out, "#text(fill: luma(120))[\\[{}\\]]", escape_markup(label));
+                }
+            },
+            Inline::FootnoteRef { label, number } => match self.doc.footnote(*number) {
+                Some(f) if !f.blocks.is_empty() => {
+                    let blocks = f.blocks.clone();
+                    let inner = self.capture(|r| r.blocks(&blocks));
+                    let _ = write!(self.out, "#footnote[{inner}]");
+                }
+                _ => {
+                    let _ = write!(self.out, "#super[{}]", escape_markup(label));
+                }
+            },
+            Inline::Task { checked, .. } => {
+                let _ = write!(self.out, "#md-check({checked}) ");
+            }
+            Inline::SoftBreak => self.out.push(' '),
+            Inline::HardBreak => {
+                if self.in_heading {
+                    self.out.push(' ');
+                } else {
+                    self.out.push_str(" \\\n");
+                }
+            }
+            Inline::Html(_) => {}
         }
     }
+}
 
-    fn trim_trailing_newlines(&mut self) {
-        self.pending_soft = false;
-        while self.out.ends_with('\n') || self.out.ends_with(' ') {
-            self.out.pop();
-        }
+fn image_call(vpath: &str, alt: &str, width: Option<u32>) -> String {
+    let alt = if alt.is_empty() { String::new() } else { format!(", alt: {}", typst_str(alt)) };
+    // HackMD 的寬度是 CSS 像素，1px = 0.75pt
+    let width = width.map(|w| format!(", width: {}pt", w as f32 * 0.75)).unwrap_or_default();
+    format!("md-image({}{alt}{width})", typst_str(vpath))
+}
+
+/// 數學式：可以排版就用 Typst 數學，否則以紅字顯示原始 LaTeX，避免整份 PDF 失敗。
+fn equation(tex: &str, display: bool) -> String {
+    if math::check(tex, display) {
+        math::typst_equation(tex, display)
+    } else {
+        math::fallback(tex, display)
     }
 }
 
@@ -610,21 +558,34 @@ mod tests {
 
     #[test]
     fn basic_blocks() {
-        let t = conv("# 標題\n\n一段*強調*文字。\n\n```rust\nfn main() {}\n```\n");
+        let t = conv("# 標題\n\n一段*強調*文字。\n\n```rust=\nfn main() {}\n```\n");
         assert!(t.contains("= 標題"), "{t}");
         assert!(t.contains("#emph[強調]"), "{t}");
-        assert!(t.contains("#raw(\"fn main() {}\", block: true, lang: \"rust\")"), "{t}");
+        assert!(t.contains("#md-code(raw(\"fn main() {}\", block: true, lang: \"rust\"), start: 1)"), "{t}");
     }
 
     #[test]
-    fn cjk_soft_break_has_no_space() {
-        let t = conv("第一行\n第二行\nabc\ndef");
+    fn hackmd_breaks_and_cjk_soft_break() {
+        assert!(conv("第一行\n第二行").contains("第一行 \\\n第二行"));
+        let t = conv("---\nbreaks: false\n---\n第一行\n第二行\nabc\ndef");
         assert!(t.contains("第一行第二行 abc def"), "{t}");
     }
 
     #[test]
-    fn footnotes_inline() {
-        let t = conv("正文[^1]。\n\n[^1]: 註腳內容\n");
+    fn hackmd_inline_and_blocks() {
+        let t = conv("==亮== ++底++ x^2^\n\n:::warning 注意\n小心\n:::\n\n[TOC]\n\n## 小節");
+        assert!(t.contains("#highlight(fill: rgb(\"#fff3a3\"))[亮]"), "{t}");
+        assert!(t.contains("#underline[底]"), "{t}");
+        assert!(t.contains("#super[2]"), "{t}");
+        assert!(t.contains("#md-box(\"warning\", title: [注意])[小心]"), "{t}");
+        assert!(t.contains("#md-toc(((1, [小節]),))"), "{t}");
+    }
+
+    #[test]
+    fn math_and_footnotes() {
+        let t = conv("$E=mc^2$ 與註[^1]\n\n$$\n\\frac{1}{2}\n$$\n\n[^1]: 註腳內容\n");
+        assert!(t.contains("#math.equation(block: false"), "{t}");
+        assert!(t.contains("#math.equation(block: true"), "{t}");
         assert!(t.contains("#footnote[註腳內容]"), "{t}");
     }
 

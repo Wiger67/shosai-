@@ -10,6 +10,7 @@
 
 mod app;
 mod cli;
+mod md_view;
 
 /// 程式啟動時間（用於 `SHOSAI_STARTUP_TRACE` 量測啟動速度）。
 pub static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();

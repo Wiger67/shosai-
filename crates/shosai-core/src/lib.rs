@@ -8,8 +8,10 @@
 
 pub mod book;
 pub mod export;
+pub mod hmd;
 pub mod library;
 pub mod markdown;
+pub mod math;
 #[cfg(feature = "nextcloud")]
 pub mod sync;
 

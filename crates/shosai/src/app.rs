@@ -6,10 +6,11 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui::{self, Color32, FontId, Key, KeyboardShortcut, Modifiers, RichText, TextStyle};
-use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use serde::{Deserialize, Serialize};
 use shosai_core::book::{is_book, BookMeta};
 use shosai_core::{library, markdown, Book, Entry, EntryKind, Library};
+
+use crate::md_view::{MdView, ViewEvent};
 
 const AUTOSAVE_AFTER: Duration = Duration::from_millis(1200);
 
@@ -175,7 +176,8 @@ pub struct ShosaiApp {
     library: Option<Library>,
     books: HashMap<PathBuf, Book>,
     doc: Option<OpenDoc>,
-    md_cache: CommonMarkCache,
+    md_view: MdView,
+    view_events: Vec<ViewEvent>,
     dialog: Option<Dialog>,
     actions: Vec<Action>,
     status: Option<Status>,
@@ -204,7 +206,8 @@ impl ShosaiApp {
             library: None,
             books: HashMap::new(),
             doc: None,
-            md_cache: CommonMarkCache::default(),
+            md_view: MdView::default(),
+            view_events: Vec::new(),
             dialog: None,
             actions: Vec::new(),
             status: None,
@@ -305,7 +308,7 @@ impl ShosaiApp {
                     words_stale: false,
                 });
                 self.settings.last_file = Some(path.to_path_buf());
-                self.md_cache = CommonMarkCache::default();
+                self.md_view = MdView::default();
             }
             Err(e) => self.error(format!("無法開啟 {}：{e}", path.display())),
         }
@@ -459,6 +462,47 @@ impl ShosaiApp {
                 }
             }
             Err(e) => self.error(e),
+        }
+    }
+
+    /// 處理預覽 / 閱讀畫面中的點擊（待辦勾選、連結）。
+    fn handle_view_events(&mut self, ctx: &egui::Context) {
+        for ev in std::mem::take(&mut self.view_events) {
+            match ev {
+                ViewEvent::ToggleTask(offset) => {
+                    let Some(doc) = self.doc.as_mut() else { continue };
+                    let replacement = match doc.text.get(offset..offset + 3) {
+                        Some("[ ]") => "[x]",
+                        Some("[x]") | Some("[X]") => "[ ]",
+                        _ => continue,
+                    };
+                    doc.text.replace_range(offset..offset + 3, replacement);
+                    doc.dirty = true;
+                    doc.words_stale = true;
+                    doc.last_edit = Instant::now();
+                }
+                ViewEvent::OpenLink(url) => {
+                    if url.starts_with('#') {
+                        self.md_view.scroll_to(&url);
+                    } else if url.contains("://") || url.starts_with("mailto:") {
+                        ctx.open_url(egui::OpenUrl::new_tab(url));
+                    } else if let Some(dir) = self.doc.as_ref().and_then(|d| d.path.parent()) {
+                        // 相對連結：Markdown 檔在書齋中開啟，其他檔案交給系統
+                        let (file, anchor) = url.split_once('#').unwrap_or((url.as_str(), ""));
+                        let target = dir.join(shosai_core::export::percent_decode_pub(file));
+                        if shosai_core::is_markdown(&target) && target.is_file() {
+                            self.actions.push(Action::Open(target));
+                            if !anchor.is_empty() {
+                                self.md_view.scroll_to(anchor);
+                            }
+                        } else if target.exists() {
+                            self.actions.push(Action::Reveal(target));
+                        } else {
+                            self.error(format!("找不到連結的檔案：{file}"));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -820,13 +864,12 @@ impl ShosaiApp {
 
     fn preview(&mut self, ui: &mut egui::Ui) {
         let Some(doc) = self.doc.as_ref() else { return };
-        let base = doc.path.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let base = doc.path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let md_view = &mut self.md_view;
+        let events = &mut self.view_events;
         egui::ScrollArea::vertical().id_salt(("preview", &doc.path)).auto_shrink([false, false]).show(ui, |ui| {
             egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 10)).show(ui, |ui| {
-                CommonMarkViewer::new()
-                    .default_implicit_uri_scheme(format!("file://{base}/"))
-                    .max_image_width(Some(ui.available_width() as usize))
-                    .show(ui, &mut self.md_cache, &doc.text);
+                events.extend(md_view.show(ui, &doc.text, &base));
             });
         });
     }
@@ -869,7 +912,10 @@ impl ShosaiApp {
         };
         let size = self.settings.reader_size;
         let max_w = self.settings.reader_width;
-        let base = path.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let md_view = &mut self.md_view;
+        let events = &mut self.view_events;
+        let actions = &mut self.actions;
 
         egui::Frame::new().fill(desk).show(ui, |ui| {
             egui::ScrollArea::vertical().id_salt(("reader", &path)).auto_shrink([false, false]).show(ui, |ui| {
@@ -906,23 +952,20 @@ impl ShosaiApp {
                                     });
                                     ui.add_space(size);
                                 }
-                                CommonMarkViewer::new()
-                                    .default_implicit_uri_scheme(format!("file://{base}/"))
-                                    .max_image_width(Some(ui.available_width() as usize))
-                                    .show(ui, &mut self.md_cache, &doc.text);
+                                events.extend(md_view.show(ui, &doc.text, &base));
 
                                 ui.add_space(size * 2.0);
                                 ui.separator();
                                 ui.horizontal(|ui| {
                                     if let Some((p, t)) = &prev {
                                         if ui.button(format!("‹ {t}")).on_hover_text("← 上一章").clicked() {
-                                            self.actions.push(Action::Open(p.clone()));
+                                            actions.push(Action::Open(p.clone()));
                                         }
                                     }
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         if let Some((p, t)) = &next {
                                             if ui.button(format!("{t} ›")).on_hover_text("下一章 →").clicked() {
-                                                self.actions.push(Action::Open(p.clone()));
+                                                actions.push(Action::Open(p.clone()));
                                             }
                                         }
                                         if let Some(i) = pos {
@@ -1226,6 +1269,7 @@ impl eframe::App for ShosaiApp {
         }
 
         self.dialogs(&ctx);
+        self.handle_view_events(&ctx);
         self.process_actions(&ctx);
         self.poll_sync();
 

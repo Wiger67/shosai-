@@ -18,11 +18,15 @@ fn out_dir() -> PathBuf {
 #[test]
 fn sample_book_to_html_and_typst() {
     let book = Book::open(&sample()).unwrap();
-    assert_eq!(book.chapters.len(), 3);
+    assert_eq!(book.chapters.len(), 4);
     let doc = book.to_document().unwrap();
     let html = export::html::render(&doc);
     assert!(html.contains("data:image/svg+xml;base64,"));
     assert!(html.contains("書齋使用手冊"));
+    assert!(html.contains("class=\"alert alert-warning\""));
+    assert!(html.contains("<mark>螢光筆標記</mark>"));
+    #[cfg(feature = "pdf")]
+    assert!(html.contains("class=\"math\""), "數學式應轉成 SVG");
     let typ = export::typst::render(&doc);
     assert_eq!(typ.images.len(), 1);
     std::fs::write(out_dir().join("sample.typ"), &typ.source).unwrap();

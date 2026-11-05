@@ -2,15 +2,9 @@
 
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
-/// 全專案統一使用的 Markdown 擴充語法。
+/// 全專案統一使用的 Markdown 解析選項（HackMD 相容）。
 pub fn options() -> Options {
-    Options::ENABLE_TABLES
-        | Options::ENABLE_FOOTNOTES
-        | Options::ENABLE_STRIKETHROUGH
-        | Options::ENABLE_TASKLISTS
-        | Options::ENABLE_SMART_PUNCTUATION
-        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
-        | Options::ENABLE_GFM
+    crate::hmd::options()
 }
 
 /// 一個標題項目（用於大綱 / 目錄）。
@@ -47,9 +41,9 @@ pub fn outline(md: &str) -> Vec<Heading> {
     out
 }
 
-/// 文件的第一個一級標題（若有）。
+/// 文件標題：第一個一級標題，否則 front matter 的 `title`。
 pub fn title(md: &str) -> Option<String> {
-    outline(md).into_iter().find(|h| h.level == 1).map(|h| h.text).filter(|t| !t.is_empty())
+    crate::hmd::parse(md).title().filter(|t| !t.is_empty())
 }
 
 pub(crate) fn level_num(level: HeadingLevel) -> u8 {

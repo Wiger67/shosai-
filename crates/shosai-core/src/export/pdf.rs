@@ -23,6 +23,12 @@ pub fn compile(out: &TypstOutput) -> Result<Vec<u8>> {
     external::compile(out)
 }
 
+/// 用 Typst 編譯一份原始碼，回傳第一頁的 SVG（給數學式預覽用）。
+#[cfg(feature = "pdf")]
+pub fn compile_svg(source: &str) -> Result<String> {
+    embedded::compile_svg(source)
+}
+
 /// 預先在背景掃描系統字型，讓第一次輸出 PDF 時更快。
 pub fn warm_up() {
     #[cfg(feature = "pdf")]
@@ -49,11 +55,19 @@ mod embedded {
     use super::TypstOutput;
     use crate::{Error, Result};
 
+    /// New Computer Modern Math（GUST Font License），見 assets/fonts/README.md。
+    static MATH_FONT: &[u8] = include_bytes!("../../assets/fonts/NewCMMath-Regular.otf");
+
     /// 字型只掃描一次，之後重複使用。
     pub fn fonts() -> &'static FontStore {
         static FONTS: OnceLock<FontStore> = OnceLock::new();
         FONTS.get_or_init(|| {
             let mut store = FontStore::new();
+            // 數學字型固定內建，讓數學式在任何電腦上都一樣好看
+            if let Some(font) = Font::new(Bytes::new(MATH_FONT), 0) {
+                let info = font.info().clone();
+                store.push((font, info));
+            }
             #[cfg(feature = "bundled-fonts")]
             store.extend(typst_kit::fonts::embedded());
             store.extend(typst_kit::fonts::system());
@@ -73,7 +87,19 @@ mod embedded {
     struct ShosaiWorld {
         main: Source,
         files: HashMap<FileId, PathBuf>,
+        /// 內建的虛擬檔案（MiTeX 數學式定義）
+        memory: &'static HashMap<FileId, Bytes>,
         fonts: &'static FontStore,
+    }
+
+    fn memory_files() -> &'static HashMap<FileId, Bytes> {
+        static FILES: OnceLock<HashMap<FileId, Bytes>> = OnceLock::new();
+        FILES.get_or_init(|| {
+            crate::math::MITEX_FILES
+                .iter()
+                .filter_map(|(path, text)| Some((file_id(path)?, Bytes::from_string(text.to_string()))))
+                .collect()
+        })
     }
 
     impl World for ShosaiWorld {
@@ -103,6 +129,9 @@ mod embedded {
             if id == self.main.id() {
                 return Ok(Bytes::from_string(self.main.text().to_string()));
             }
+            if let Some(bytes) = self.memory.get(&id) {
+                return Ok(bytes.clone());
+            }
             let path = self.files.get(&id).ok_or_else(|| FileError::NotFound(id.vpath().get_with_slash().into()))?;
             std::fs::read(path).map(Bytes::new).map_err(|e| FileError::from_io(e, path))
         }
@@ -118,16 +147,30 @@ mod embedded {
         }
     }
 
-    pub fn compile(out: &TypstOutput) -> Result<Vec<u8>> {
+    fn world(source: String, images: &[(String, PathBuf)]) -> ShosaiWorld {
         let main_id = file_id("/__shosai_main.typ").expect("valid path");
-        let files = out.images.iter().filter_map(|(vpath, real)| Some((file_id(vpath)?, real.clone()))).collect();
-        let world = ShosaiWorld { main: Source::new(main_id, out.source.clone()), files, fonts: fonts() };
+        let files = images.iter().filter_map(|(vpath, real)| Some((file_id(vpath)?, real.clone()))).collect();
+        ShosaiWorld { main: Source::new(main_id, source), files, memory: memory_files(), fonts: fonts() }
+    }
 
+    pub fn compile(out: &TypstOutput) -> Result<Vec<u8>> {
+        let world = world(out.source.clone(), &out.images);
         let result = typst::compile::<PagedDocument>(&world);
         let document = result.output.map_err(|errs| Error::Export(format_errors(&world, &errs)))?;
         let pdf = typst_pdf::pdf(&document, &typst_pdf::PdfOptions::default())
             .map_err(|errs| Error::Export(format_errors(&world, &errs)))?;
+        typst::comemo::evict(10);
         Ok(pdf)
+    }
+
+    pub fn compile_svg(source: &str) -> Result<String> {
+        let world = world(source.to_string(), &[]);
+        let result = typst::compile::<PagedDocument>(&world);
+        let document = result.output.map_err(|errs| Error::Export(format_errors(&world, &errs)))?;
+        let page = document.pages().first().ok_or_else(|| Error::Export("沒有內容".into()))?;
+        // 保留快取一段時間：同一份文件的數學式會反覆渲染
+        typst::comemo::evict(60);
+        Ok(typst_svg::svg(page, &typst_svg::SvgOptions::default()))
     }
 
     fn format_errors(world: &ShosaiWorld, errs: &[SourceDiagnostic]) -> String {
@@ -159,6 +202,11 @@ mod external {
         std::fs::create_dir_all(dir.join("__img"))?;
         for (vpath, real) in &out.images {
             std::fs::copy(real, dir.join(vpath.trim_start_matches('/')))?;
+        }
+        for (vpath, text) in crate::math::MITEX_FILES {
+            let path = dir.join(vpath.trim_start_matches('/'));
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            std::fs::write(path, text)?;
         }
         let main = dir.join("main.typ");
         let pdf = dir.join("main.pdf");

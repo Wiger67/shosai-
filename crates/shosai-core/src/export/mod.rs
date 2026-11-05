@@ -63,6 +63,11 @@ pub(crate) fn resolve_local_image(base_dir: &Path, url: &str) -> Option<PathBuf>
     path.is_file().then_some(path)
 }
 
+/// 解碼網址中的 `%XX`（例如連結中的中文檔名）。
+pub fn percent_decode_pub(s: &str) -> String {
+    percent_decode(s)
+}
+
 pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());

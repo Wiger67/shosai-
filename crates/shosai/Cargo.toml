@@ -7,8 +7,7 @@ license.workspace = true
 [dependencies]
 shosai-core = { path = "../shosai-core", default-features = false }
 eframe = { version = "0.37", default-features = false, features = ["glow", "x11", "wayland", "clipboard", "links", "default_fonts", "system_fonts", "persistence"] }
-egui_commonmark = { version = "0.26", default-features = false, features = ["pulldown_cmark", "load-images", "svg"] }
-egui_extras = { version = "0.37", default-features = false, features = ["image", "file"] }
+egui_extras = { version = "0.37", default-features = false, features = ["image", "file", "svg"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 serde = { version = "1", features = ["derive"] }
 rfd = "0.15"

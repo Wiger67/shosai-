@@ -8,11 +8,16 @@
 - 📄 **輸出 PDF**：內建 [Typst](https://typst.app) 排版引擎，含封面、目錄、「第一章」章名頁、頁首、頁碼、註腳、圖說，不必另外安裝任何軟體
 - 🌐 **輸出 HTML**：單一檔案、圖片內嵌，瀏覽器可直接閱讀或列印
 - ☁️ **Nextcloud 同步**（實驗性）：透過 WebDAV 雙向同步，衝突時兩份都保留
+- ∑ **LaTeX 數學式與 HackMD 語法**：`$...$`、`$$...$$`、`:::info` 提示框、`==螢光==`、`[TOC]`… 在 HackMD 寫的筆記可以直接搬過來
 - 🀄 中文優先：中文字型依需求從系統載入、段落首行縮排、中文換行不多出空白
 
 | 閱讀模式 | 分割模式 |
 |---|---|
 | ![閱讀模式](docs/reader.png) | ![分割模式](docs/split.png) |
+
+HackMD 語法與 LaTeX 數學式（閱讀模式）：
+
+![HackMD 語法與數學式](docs/hackmd.png)
 
 輸出的 PDF（A5，封面 → 目錄 → 章節）：
 
@@ -40,7 +45,7 @@ cargo build --release
 
 | feature | 預設 | 說明 |
 |---|---|---|
-| `pdf` | ✅ | 內嵌 Typst PDF 引擎。關閉後執行檔約 15 MB，輸出 PDF 改呼叫系統的 `typst` 指令 |
+| `pdf` | ✅ | 內嵌 Typst PDF 引擎。關閉後執行檔較小，輸出 PDF 改呼叫系統的 `typst` 指令，但預覽畫面無法顯示數學式 |
 | `bundled-fonts` | | 把 Typst 內建字型（約 10 MB）編進執行檔，適合沒有字型的伺服器／容器 |
 | `nextcloud` | | Nextcloud／WebDAV 同步 |
 
@@ -112,8 +117,36 @@ fonts = ["Noto Serif CJK TC", "Source Han Serif TC", "PingFang TC", "Microsoft J
 章節標題取自檔案中第一個 `# 一級標題`，沒有的話用去掉編號的檔名（`01-序章.md` → 序章）。
 在 Markdown 中寫 `<!-- pagebreak -->` 可以強制換頁。
 
-支援的 Markdown：標題、粗斜體、刪除線、行內程式碼、連結、圖片（PNG/JPG/GIF/SVG/WebP）、
-清單（含巢狀、待辦清單）、引言、表格（含對齊）、程式碼區塊（含語法標示）、分隔線、註腳、YAML front matter。
+## Markdown 語法（與 HackMD 相容）
+
+書齋的語法盡量與 [HackMD](https://hackmd.io) 一致。GUI 預覽、閱讀模式、PDF、HTML 共用同一個解析器，
+所以四個地方顯示的結果一致。完整示範見 [`examples/範例書/03-HackMD與數學式.md`](examples/範例書/03-HackMD與數學式.md)。
+
+| 語法 | 寫法 |
+|---|---|
+| 行內數學式 | `$E = mc^2$` |
+| 獨立數學式 | `$$ ... $$` 或 ` ```math ` 程式碼區塊 |
+| 螢光筆／插入（底線） | `==重點==`、`++新增++` |
+| 上標／下標／刪除線 | `x^2^`、`H~2~O`、`~~刪除~~` |
+| 提示框 | `:::info`、`:::success`、`:::warning 標題`、`:::danger` … `:::` |
+| 摺疊區塊 | `:::spoiler 標題` … `:::` |
+| 目錄 | 單獨一行 `[TOC]` |
+| 表情符號 | `:smile:` `:rocket:` |
+| 圖片尺寸 | `![說明](a.png =200x)`、`=200x100`、`=x100` |
+| 程式碼行號 | ` ```js= `（從 1 開始）、` ```js=101 `（從 101 開始） |
+| 定義清單 | `名詞` 換行 `: 解釋` |
+| 嵌入影片 | `{%youtube 影片ID %}`（轉成連結） |
+| 換行 | 與 HackMD 相同，**單一換行就換行**；front matter 寫 `breaks: false` 可關閉 |
+
+另外也支援：標題、粗斜體、行內程式碼、連結、圖片（PNG/JPG/GIF/SVG/WebP）、清單（含巢狀、待辦清單，
+預覽中可直接勾選）、引言、GitHub 提示 `> [!NOTE]`、表格（含對齊）、程式碼語法標示、分隔線、註腳、YAML front matter。
+
+**數學式**以 LaTeX 撰寫，透過 [MiTeX](https://github.com/mitex-rs/mitex) 轉成 Typst 排版：
+PDF 中是向量數學式，GUI 與 HTML 則顯示為 SVG。常用的分數、根號、積分、矩陣、`cases`、`aligned`、
+希臘字母、`\mathbb`、`\text{中文}` 等都支援；無法排版的式子會以紅字顯示原始 LaTeX，不會讓整份 PDF 失敗。
+數學字型 New Computer Modern Math 已內建，不需另外安裝。
+
+尚未支援（會以程式碼區塊顯示）：`mermaid`、`sequence`、`flow`、`graphviz`、`abc` 等圖表。
 
 > **字型**：PDF 會依序嘗試 `fonts` 中的字型，找不到時自動退回系統中任何有該字的字型。
 > 想要好看的中文 PDF，建議安裝思源宋體／Noto Serif CJK TC。
@@ -157,6 +190,8 @@ crates/
 ├── shosai-core/          核心函式庫（無 GUI，可單獨使用）
 │   ├── library.rs        掃描書庫、新增／改名／移動／回收桶
 │   ├── book.rs           book.toml、章節排序
+│   ├── hmd.rs            HackMD 相容解析器（語法樹，GUI／PDF／HTML 共用）
+│   ├── math.rs           LaTeX 數學式 → Typst（MiTeX）→ PDF／SVG
 │   ├── markdown.rs       大綱、標題、中文字數統計
 │   ├── export/
 │   │   ├── typst.rs      Markdown → Typst 轉換＋書本版型
@@ -164,6 +199,7 @@ crates/
 │   │   └── html.rs       單檔 HTML 輸出
 │   └── sync.rs           Nextcloud WebDAV 同步
 └── shosai/               GUI（egui）與命令列
+    └── md_view.rs        GUI 的 Markdown 渲染器
 ```
 
 ```bash
@@ -181,7 +217,7 @@ cargo test --workspace --all-features   # 單元測試＋把範例書實際輸�
 
 - [ ] 編輯器語法上色、大綱跳轉、全文搜尋
 - [ ] 背景自動同步（定時／存檔後）與同步狀態指示
-- [ ] 數學公式（LaTeX → Typst）
+- [ ] mermaid／流程圖等圖表
 - [ ] 自訂 PDF 版型（使用者自己的 Typst 樣板）
 - [ ] EPUB 輸出
 
