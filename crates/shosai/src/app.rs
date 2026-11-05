@@ -12,11 +12,9 @@ use shosai_core::{library, markdown, Book, Entry, EntryKind, Library};
 
 use crate::icons::{self, Icon};
 use crate::md_view::{MdView, ViewEvent};
-use crate::pdf_view::PdfView;
+use crate::pdf_view::{Fit, PdfView};
 use crate::theme::{self, Palette};
 use crate::tree::{self, TreeCtx};
-
-const AUTOSAVE_AFTER: Duration = Duration::from_millis(1200);
 
 pub fn run(open: Option<PathBuf>) -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -55,6 +53,21 @@ struct Settings {
     sidebar: bool,
     /// 側欄中展開的資料夾 / 書本
     expanded: HashSet<PathBuf>,
+    /// 介面縮放（1.0 = 100%）
+    ui_scale: f32,
+    /// 編輯器使用一般字型（否則等寬）
+    editor_proportional: bool,
+    /// 停止輸入幾秒後自動儲存
+    autosave_secs: f32,
+    show_word_count: bool,
+    /// 側欄
+    show_pdfs: bool,
+    show_counts: bool,
+    /// PDF
+    pdf_fit: Fit,
+    pdf_thumbs: bool,
+    /// 每個 PDF 上次讀到的頁（從 0 起算）
+    pdf_pages: HashMap<PathBuf, usize>,
 }
 
 impl Default for Settings {
@@ -70,6 +83,15 @@ impl Default for Settings {
             reader_width: 720.0,
             sidebar: true,
             expanded: HashSet::new(),
+            ui_scale: 1.0,
+            editor_proportional: false,
+            autosave_secs: 1.2,
+            show_word_count: true,
+            show_pdfs: true,
+            show_counts: true,
+            pdf_fit: Fit::Width,
+            pdf_thumbs: true,
+            pdf_pages: HashMap::new(),
         }
     }
 }
@@ -149,7 +171,6 @@ pub(crate) enum Dialog {
     /// 同步結果
     Report(String),
     Shortcuts,
-    About,
 }
 
 pub(crate) enum Action {
@@ -196,6 +217,43 @@ pub struct ShosaiApp {
     filter: String,
     first_frame: bool,
     applied_theme: Option<Option<bool>>,
+    applied_scale: f32,
+    show_settings: bool,
+    settings_tab: SettingsTab,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsTab {
+    Appearance,
+    Editor,
+    Reader,
+    Pdf,
+    Sidebar,
+    Library,
+    About,
+}
+
+impl SettingsTab {
+    const ALL: [SettingsTab; 7] = [
+        SettingsTab::Appearance,
+        SettingsTab::Editor,
+        SettingsTab::Reader,
+        SettingsTab::Pdf,
+        SettingsTab::Sidebar,
+        SettingsTab::Library,
+        SettingsTab::About,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            SettingsTab::Appearance => "外觀",
+            SettingsTab::Editor => "編輯器",
+            SettingsTab::Reader => "閱讀",
+            SettingsTab::Pdf => "PDF",
+            SettingsTab::Sidebar => "側欄",
+            SettingsTab::Library => "書庫與同步",
+            SettingsTab::About => "關於",
+        }
+    }
 }
 
 impl ShosaiApp {
@@ -221,6 +279,9 @@ impl ShosaiApp {
             filter: String::new(),
             first_frame: true,
             applied_theme: None,
+            applied_scale: 0.0,
+            show_settings: false,
+            settings_tab: SettingsTab::Appearance,
         };
 
         // 決定開啟的書庫與檔案：命令列參數 > 上次狀態
@@ -305,7 +366,8 @@ impl ShosaiApp {
         if shosai_core::is_pdf(path) {
             if cfg!(feature = "pdf") {
                 self.doc = None;
-                self.pdf = Some(PdfView::open(path, &self.ctx));
+                let page = self.settings.pdf_pages.get(path).copied().unwrap_or(0);
+                self.pdf = Some(PdfView::open(path, &self.ctx, self.settings.pdf_fit, self.settings.pdf_thumbs, page));
                 self.settings.last_file = Some(path.to_path_buf());
             } else {
                 open_path(path);
@@ -595,6 +657,20 @@ impl ShosaiApp {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let cmd = Modifiers::COMMAND;
+        let (goto, settings) = ctx.input_mut(|i| {
+            (
+                i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::G)),
+                i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::Comma)),
+            )
+        });
+        if goto {
+            if let Some(pdf) = self.pdf.as_mut() {
+                pdf.focus_page_input();
+            }
+        }
+        if settings {
+            self.show_settings = !self.show_settings;
+        }
         let (save, edit, split, read, sidebar, new_note, zoom_in, zoom_out) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::S)),
@@ -674,6 +750,10 @@ impl ShosaiApp {
     }
 
     fn apply_theme(&mut self, ctx: &egui::Context) {
+        if self.applied_scale != self.settings.ui_scale {
+            self.applied_scale = self.settings.ui_scale;
+            ctx.set_zoom_factor(self.settings.ui_scale.clamp(0.7, 2.0));
+        }
         if self.applied_theme == Some(self.settings.dark) {
             return;
         }
@@ -687,62 +767,33 @@ impl ShosaiApp {
 
     fn toolbar(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         ui.horizontal_centered(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let tip = if self.settings.sidebar { "隱藏側欄 (Ctrl+B)" } else { "顯示側欄 (Ctrl+B)" };
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let tip = if self.settings.sidebar { "隱藏側欄（Ctrl+B）" } else { "顯示側欄（Ctrl+B）" };
             if icons::button(ui, Icon::Sidebar, tip).clicked() {
                 self.settings.sidebar = !self.settings.sidebar;
             }
-            ui.add_space(8.0);
+            if icons::button(ui, Icon::Gear, "設定（Ctrl+,）").clicked() {
+                self.show_settings = true;
+            }
+            ui.add_space(10.0);
 
             if self.doc.is_some() {
                 self.mode_switch(ui);
-            } else if let Some(pdf) = &self.pdf {
-                if pdf.page_count() > 0 {
-                    ui.label(
-                        RichText::new(format!("第 {} / {} 頁", pdf.current + 1, pdf.page_count())).color(pal.weak),
-                    );
-                }
+            } else if let Some(pdf) = self.pdf.as_mut() {
+                pdf.toolbar_left(ui, pal);
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 self.more_menu(ui);
-                let (icon, next, tip) = match self.settings.dark {
-                    None => (Icon::Auto, Some(false), "主題：跟隨系統"),
-                    Some(false) => (Icon::Sun, Some(true), "主題：淺色"),
-                    Some(true) => (Icon::Moon, None, "主題：深色"),
-                };
-                if icons::button(ui, icon, tip).clicked() {
-                    self.settings.dark = next;
-                }
-                ui.add_space(6.0);
-
                 if let Some(pdf) = self.pdf.as_mut() {
                     if icons::button(ui, Icon::External, "用預設程式開啟").clicked() {
                         self.actions.push(Action::Reveal(pdf.path.clone()));
                     }
-                    if icons::button(ui, Icon::FitWidth, "符合寬度").clicked() {
-                        pdf.fit_width();
-                    }
-                    if icons::button(ui, Icon::Plus, "放大 (Ctrl+=)").clicked() {
-                        pdf.zoom_by(1.2);
-                    }
-                    ui.label(RichText::new(format!("{:.0}%", pdf.effective_zoom() * 100.0)).color(pal.weak));
-                    if icons::button(ui, Icon::Minus, "縮小 (Ctrl+-)").clicked() {
-                        pdf.zoom_by(1.0 / 1.2);
-                    }
+                    ui.add_space(6.0);
+                    pdf.toolbar_right(ui, pal);
                 } else if self.doc.is_some() {
                     self.export_menu(ui);
-                    ui.add_space(6.0);
-                    let reading = self.settings.view == ViewMode::Read;
-                    let size = if reading { &mut self.settings.reader_size } else { &mut self.settings.editor_size };
-                    if icons::button(ui, Icon::Plus, "放大字體 (Ctrl+=)").clicked() {
-                        *size = (*size + 1.0).min(40.0);
-                    }
-                    ui.label(RichText::new(format!("{size:.0}")).color(pal.weak));
-                    if icons::button(ui, Icon::Minus, "縮小字體 (Ctrl+-)").clicked() {
-                        *size = (*size - 1.0).max(9.0);
-                    }
                 }
             });
         });
@@ -819,8 +870,13 @@ impl ShosaiApp {
                 self.dialog = Some(Dialog::Shortcuts);
                 ui.close();
             }
+            if ui.button("設定…").clicked() {
+                self.show_settings = true;
+                ui.close();
+            }
             if ui.button("關於書齋").clicked() {
-                self.dialog = Some(Dialog::About);
+                self.settings_tab = SettingsTab::About;
+                self.show_settings = true;
                 ui.close();
             }
         });
@@ -852,7 +908,9 @@ impl ShosaiApp {
                     let resp =
                         ui.add(egui::Label::new(RichText::new(text).small().color(color)).sense(egui::Sense::click()));
                     save = resp.on_hover_text("Ctrl+S 儲存（停止輸入後也會自動儲存）").clicked();
-                    ui.label(RichText::new(format!("{} 字", doc.words)).small().color(pal.weak));
+                    if self.settings.show_word_count {
+                        ui.label(RichText::new(format!("{} 字", doc.words)).small().color(pal.weak));
+                    }
                 }
                 if save {
                     self.save_current();
@@ -955,6 +1013,9 @@ impl ShosaiApp {
                 if icons::button_sized(ui, Icon::Refresh, "重新整理", 26.0).clicked() {
                     self.actions.push(Action::Refresh);
                 }
+                if icons::button_sized(ui, Icon::Collapse, "全部收合", 26.0).clicked() {
+                    self.settings.expanded.clear();
+                }
                 #[cfg(feature = "nextcloud")]
                 {
                     let busy = self.sync_job.is_some();
@@ -1008,6 +1069,9 @@ impl ShosaiApp {
                 actions: &mut self.actions,
                 expanded: &mut self.settings.expanded,
                 pal: *pal,
+                show_pdfs: self.settings.show_pdfs,
+                show_counts: self.settings.show_counts,
+                lib_root: &root,
             };
             if !self.filter.trim().is_empty() {
                 let q = self.filter.trim().to_lowercase();
@@ -1044,6 +1108,7 @@ impl ShosaiApp {
 
     fn editor(&mut self, ui: &mut egui::Ui, centered: bool) {
         let size = self.settings.editor_size;
+        let proportional = self.settings.editor_proportional;
         let Some(doc) = self.doc.as_mut() else { return };
         egui::ScrollArea::vertical().id_salt(("editor", &doc.path)).auto_shrink([false, false]).show(ui, |ui| {
             let full = ui.available_width();
@@ -1056,7 +1121,7 @@ impl ShosaiApp {
                     .inner_margin(egui::Margin::symmetric(pad, 6))
                     .show(ui, |ui| {
                         let edit = egui::TextEdit::multiline(&mut doc.text)
-                            .font(FontId::monospace(size))
+                            .font(if proportional { FontId::proportional(size) } else { FontId::monospace(size) })
                             .desired_width(width - 2.0 * pad as f32)
                             .desired_rows(30)
                             .lock_focus(true)
@@ -1240,6 +1305,201 @@ impl ShosaiApp {
         });
     }
 
+    /// 設定視窗（左上角齒輪 / Ctrl+,）。調整會立即套用並自動保存。
+    fn settings_window(&mut self, ctx: &egui::Context, pal: &Palette) {
+        if !self.show_settings {
+            return;
+        }
+        let mut open = true;
+        let modal = egui::Modal::new(egui::Id::unique("shosai-settings")).show(ctx, |ui| {
+            ui.set_width(640.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("設定").size(18.0).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let done = egui::Button::new(RichText::new("完成").color(Color32::WHITE))
+                        .fill(pal.accent)
+                        .min_size(egui::vec2(68.0, 28.0));
+                    if ui.add(done).clicked() {
+                        open = false;
+                    }
+                });
+            });
+            ui.add_space(10.0);
+            ui.horizontal_top(|ui| {
+                // 左：分類
+                ui.vertical(|ui| {
+                    ui.set_width(128.0);
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for tab in SettingsTab::ALL {
+                        let selected = self.settings_tab == tab;
+                        let btn = egui::Button::selectable(selected, tab.label()).min_size(egui::vec2(124.0, 30.0));
+                        if ui.add(btn).clicked() {
+                            self.settings_tab = tab;
+                        }
+                    }
+                });
+                ui.add_space(12.0);
+                // 右：內容
+                egui::Frame::new().fill(ui.visuals().faint_bg_color).corner_radius(8).inner_margin(18).show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(466.0);
+                        ui.set_min_height(380.0);
+                        egui::ScrollArea::vertical().max_height(400.0).auto_shrink([false, true]).show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 10.0;
+                            self.settings_page(ui, pal);
+                        });
+                    });
+                });
+            });
+        });
+        if modal.should_close() {
+            open = false;
+        }
+        self.show_settings = open;
+    }
+
+    fn settings_page(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        let st = &mut self.settings;
+        let heading = |ui: &mut egui::Ui, t: &str| {
+            ui.add_space(4.0);
+            ui.label(RichText::new(t).strong().size(15.0));
+        };
+        let hint = |ui: &mut egui::Ui, t: &str| {
+            ui.label(RichText::new(t).small().color(pal.weak));
+        };
+        match self.settings_tab {
+            SettingsTab::Appearance => {
+                heading(ui, "主題");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut st.dark, None, "跟隨系統");
+                    ui.selectable_value(&mut st.dark, Some(false), "淺色");
+                    ui.selectable_value(&mut st.dark, Some(true), "深色");
+                });
+                heading(ui, "介面縮放");
+                ui.add(
+                    egui::Slider::new(&mut st.ui_scale, 0.8..=1.5)
+                        .step_by(0.05)
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                );
+                hint(ui, "放大整個介面（含側欄、選單）。高解析度螢幕可設為 110%–125%。");
+            }
+            SettingsTab::Editor => {
+                heading(ui, "字級");
+                ui.add(egui::Slider::new(&mut st.editor_size, 10.0..=28.0).step_by(1.0).suffix(" px"));
+                heading(ui, "字型");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut st.editor_proportional, false, "等寬（適合對齊表格、程式碼）");
+                    ui.selectable_value(&mut st.editor_proportional, true, "一般");
+                });
+                heading(ui, "自動儲存");
+                ui.add(egui::Slider::new(&mut st.autosave_secs, 0.5..=10.0).step_by(0.5).suffix(" 秒後"));
+                hint(ui, "停止輸入一段時間後自動存檔；隨時可按 Ctrl+S 立即儲存。");
+                heading(ui, "預設模式");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut st.view, ViewMode::Edit, "編輯");
+                    ui.selectable_value(&mut st.view, ViewMode::Split, "分割");
+                    ui.selectable_value(&mut st.view, ViewMode::Read, "閱讀");
+                });
+                ui.checkbox(&mut st.show_word_count, "在狀態列顯示字數");
+            }
+            SettingsTab::Reader => {
+                heading(ui, "字級");
+                ui.add(egui::Slider::new(&mut st.reader_size, 12.0..=30.0).step_by(1.0).suffix(" px"));
+                heading(ui, "版面寬度");
+                ui.add(egui::Slider::new(&mut st.reader_width, 480.0..=1200.0).step_by(20.0).suffix(" px"));
+                hint(ui, "閱讀模式中，紙張內文的最大寬度。");
+                hint(ui, "閱讀時可用 ← → 翻到上一章 / 下一章，Ctrl+= / Ctrl+- 調整字級。");
+            }
+            SettingsTab::Pdf => {
+                heading(ui, "開啟 PDF 時的縮放");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut st.pdf_fit, Fit::Width, "符合寬度");
+                    ui.selectable_value(&mut st.pdf_fit, Fit::Page, "整頁顯示");
+                    ui.selectable_value(&mut st.pdf_fit, Fit::Zoom(1.0), "100%");
+                });
+                ui.checkbox(&mut st.pdf_thumbs, "顯示頁面縮圖列");
+                if let Some(pdf) = self.pdf.as_mut() {
+                    pdf.show_thumbs = st.pdf_thumbs;
+                }
+                heading(ui, "閱讀位置");
+                ui.horizontal(|ui| {
+                    ui.label(format!("已記住 {} 份 PDF 讀到的頁數", st.pdf_pages.len()));
+                    if ui.add_enabled(!st.pdf_pages.is_empty(), egui::Button::new("清除")).clicked() {
+                        st.pdf_pages.clear();
+                    }
+                });
+                hint(ui, "快捷鍵：← → 或 PageUp / PageDown 翻頁，Home / End 第一頁 / 最後一頁，Ctrl+G 輸入頁碼。");
+            }
+            SettingsTab::Sidebar => {
+                heading(ui, "檔案樹");
+                ui.checkbox(&mut st.show_pdfs, "顯示 PDF 檔");
+                ui.checkbox(&mut st.show_counts, "在資料夾與書本旁顯示檔案數量");
+                if ui.button("全部收合").clicked() {
+                    st.expanded.clear();
+                }
+                hint(ui, "顏色：資料夾為黃色、書本為橘色、Markdown 為藍色、PDF 為紅色。");
+            }
+            SettingsTab::Library => {
+                heading(ui, "目前的書庫");
+                match self.library.as_ref().map(|l| l.root.clone()) {
+                    Some(root) => {
+                        ui.add(
+                            egui::Label::new(RichText::new(root.display().to_string()).monospace()).selectable(true),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.button("在檔案管理員中開啟").clicked() {
+                                self.actions.push(Action::Reveal(root.clone()));
+                            }
+                            if ui.button("開啟其他資料夾…").clicked() {
+                                self.actions.push(Action::PickLibrary);
+                            }
+                        });
+                    }
+                    None => {
+                        if ui.button("開啟資料夾…").clicked() {
+                            self.actions.push(Action::PickLibrary);
+                        }
+                    }
+                }
+                heading(ui, "最近使用");
+                let recent = self.settings.recent_libraries.clone();
+                if recent.is_empty() {
+                    hint(ui, "（無）");
+                }
+                for r in recent {
+                    if ui.link(r.display().to_string()).clicked() {
+                        self.actions.push(Action::OpenLibrary(r));
+                    }
+                }
+                if !self.settings.recent_libraries.is_empty() && ui.button("清除紀錄").clicked() {
+                    self.settings.recent_libraries.clear();
+                }
+                heading(ui, "Nextcloud 同步");
+                #[cfg(feature = "nextcloud")]
+                {
+                    if let Some(root) = self.library.as_ref().map(|l| l.root.clone()) {
+                        if ui.button("同步設定…").clicked() {
+                            self.actions.push(Action::Dialog(nextcloud_dialog(&root)));
+                            self.show_settings = false;
+                        }
+                    }
+                }
+                #[cfg(not(feature = "nextcloud"))]
+                hint(ui, "此版本未啟用 Nextcloud 同步（編譯時加上 --features nextcloud）。");
+            }
+            SettingsTab::About => {
+                ui.label(RichText::new("書齋 Shosai").size(20.0).strong());
+                ui.label(format!("版本 {}", env!("CARGO_PKG_VERSION")));
+                ui.label("輕量的 Markdown 寫作與閱讀器，可將資料夾整理成書、輸出 PDF，並直接閱讀 PDF。");
+                hint(ui, "排版：Typst　數學式：MiTeX　PDF 檢視：hayro　介面：egui");
+                if ui.button("鍵盤快捷鍵…").clicked() {
+                    self.dialog = Some(Dialog::Shortcuts);
+                    self.show_settings = false;
+                }
+            }
+        }
+    }
+
     fn dialogs(&mut self, ctx: &egui::Context, pal: &Palette) {
         let Some(mut dialog) = self.dialog.take() else { return };
         let mut keep = true;
@@ -1331,6 +1591,9 @@ impl ShosaiApp {
                             ("Ctrl+B", "顯示 / 隱藏側欄"),
                             ("Ctrl+= / Ctrl+-", "放大 / 縮小（PDF 為縮放）"),
                             ("← / →", "閱讀模式翻章；PDF 翻頁"),
+                            ("Home / End", "PDF 第一頁 / 最後一頁"),
+                            ("Ctrl+G", "PDF 輸入頁碼跳頁"),
+                            ("Ctrl+,", "設定"),
                         ] {
                             ui.label(RichText::new(k).monospace());
                             ui.label(v);
@@ -1338,18 +1601,12 @@ impl ShosaiApp {
                         }
                     });
                 }
-                Dialog::About => {
-                    title(ui, "書齋 Shosai");
-                    ui.label(format!("版本 {}", env!("CARGO_PKG_VERSION")));
-                    ui.label("輕量的 Markdown 寫作與閱讀器，可將資料夾整理成書並輸出 PDF。");
-                    ui.label(RichText::new("排版：Typst　數學式：MiTeX　PDF 檢視：hayro　介面：egui").small().color(pal.weak));
-                }
             }
             ui.add_space(10.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (label, danger) = match &dialog {
                     Dialog::Trash { .. } => ("移除", true),
-                    Dialog::About | Dialog::Report(_) | Dialog::Shortcuts => ("關閉", false),
+                    Dialog::Report(_) | Dialog::Shortcuts => ("關閉", false),
                     Dialog::BookSettings { .. } => ("儲存", false),
                     _ => ("確定", false),
                 };
@@ -1360,7 +1617,7 @@ impl ShosaiApp {
                 if ui.add(primary).clicked() {
                     confirm = true;
                 }
-                if !matches!(dialog, Dialog::About | Dialog::Report(_) | Dialog::Shortcuts)
+                if !matches!(dialog, Dialog::Report(_) | Dialog::Shortcuts)
                     && ui.add(egui::Button::new("取消").min_size(egui::vec2(64.0, 28.0))).clicked()
                 {
                     keep = false;
@@ -1476,7 +1733,7 @@ impl ShosaiApp {
             }
             #[cfg(not(feature = "nextcloud"))]
             Dialog::Nextcloud { .. } => {}
-            Dialog::Report(_) | Dialog::About | Dialog::Shortcuts => {}
+            Dialog::Report(_) | Dialog::Shortcuts => {}
         }
         Ok(())
     }
@@ -1518,7 +1775,7 @@ impl eframe::App for ShosaiApp {
         if self.pdf.is_some() {
             egui::CentralPanel::no_frame().show(ui, |ui| {
                 if let Some(pdf) = self.pdf.as_mut() {
-                    pdf.show(ui, pal.desk);
+                    pdf.show(ui, &pal);
                 }
             });
         } else if self.doc.is_none() {
@@ -1545,7 +1802,15 @@ impl eframe::App for ShosaiApp {
             }
         }
 
+        self.settings_window(&ctx, &pal);
         self.dialogs(&ctx, &pal);
+        // 記住 PDF 讀到哪一頁、縮圖列開關
+        if let Some(pdf) = &self.pdf {
+            if pdf.page_count() > 0 {
+                self.settings.pdf_pages.insert(pdf.path.clone(), pdf.current);
+            }
+            self.settings.pdf_thumbs = pdf.show_thumbs;
+        }
         self.handle_view_events(&ctx);
         self.process_actions(&ctx);
         self.poll_sync();
@@ -1553,10 +1818,11 @@ impl eframe::App for ShosaiApp {
         // 自動儲存
         if let Some(doc) = &self.doc {
             if doc.dirty {
-                if doc.last_edit.elapsed() >= AUTOSAVE_AFTER {
+                let after = Duration::from_secs_f32(self.settings.autosave_secs.clamp(0.3, 30.0));
+                if doc.last_edit.elapsed() >= after {
                     self.save_current();
                 } else {
-                    ctx.request_repaint_after(AUTOSAVE_AFTER);
+                    ctx.request_repaint_after(after);
                 }
             }
         }

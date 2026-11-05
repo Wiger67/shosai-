@@ -22,6 +22,12 @@ pub struct Palette {
     /// 列表 hover / 選取背景
     pub hover: Color32,
     pub selected: Color32,
+    /// 檔案樹：各類型的圖示顏色與縮排導引線
+    pub folder: Color32,
+    pub book: Color32,
+    pub markdown: Color32,
+    pub pdf: Color32,
+    pub guide: Color32,
 }
 
 pub fn palette(dark: bool) -> Palette {
@@ -36,6 +42,11 @@ pub fn palette(dark: bool) -> Palette {
             accent: rgb(0xd6a273),
             hover: rgb(0x2c2a27),
             selected: rgb(0x3a3129),
+            folder: rgb(0xd9a94e),
+            book: rgb(0xd6895a),
+            markdown: rgb(0x8fa9c9),
+            pdf: rgb(0xe0705e),
+            guide: rgb(0x3a3834),
         }
     } else {
         Palette {
@@ -48,6 +59,11 @@ pub fn palette(dark: bool) -> Palette {
             accent: rgb(0x9a5f32),
             hover: rgb(0xe8e2d7),
             selected: rgb(0xe3d5c3),
+            folder: rgb(0xc08a2a),
+            book: rgb(0xb0582c),
+            markdown: rgb(0x4f6f96),
+            pdf: rgb(0xc4463a),
+            guide: rgb(0xddd5c7),
         }
     }
 }

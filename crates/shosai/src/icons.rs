@@ -19,13 +19,17 @@ pub enum Icon {
     ChevronDown,
     #[cfg_attr(not(feature = "nextcloud"), allow(dead_code))]
     Cloud,
-    Sun,
-    Moon,
-    Auto,
     More,
     Export,
     FitWidth,
     External,
+    Gear,
+    FolderOpen,
+    Collapse,
+    ChevronLeft,
+    FitPage,
+    Spread,
+    Thumbnails,
 }
 
 /// 圖示按鈕：平時只有圖示，滑過時出現淡淡的底色。
@@ -62,6 +66,18 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
     let s = Stroke::new(1.4, color);
     let r = rect;
     let at = |x: f32, y: f32| pos2(r.left() + x * r.width(), r.top() + y * r.height());
+    if matches!(
+        icon,
+        Icon::Gear
+            | Icon::FolderOpen
+            | Icon::Collapse
+            | Icon::ChevronLeft
+            | Icon::FitPage
+            | Icon::Spread
+            | Icon::Thumbnails
+    ) {
+        return paint_more(p, r, icon, s);
+    }
     match icon {
         Icon::Sidebar => {
             p.rect_stroke(Rect::from_min_max(at(0.08, 0.15), at(0.92, 0.85)), 2.0, s, egui::StrokeKind::Middle);
@@ -121,32 +137,6 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
             pts.extend(arc(at(0.73, 0.62), r.width() * 0.18, 1.5 * PI, 2.5 * PI));
             p.add(Shape::closed_line(pts, s));
         }
-        Icon::Sun => {
-            let c = r.center();
-            p.circle_stroke(c, r.width() * 0.2, s);
-            for i in 0..8 {
-                let a = i as f32 * TAU / 8.0;
-                let d = vec2(a.cos(), a.sin());
-                p.line_segment([c + d * r.width() * 0.32, c + d * r.width() * 0.44], s);
-            }
-        }
-        Icon::Moon => {
-            let c = r.center();
-            let rad = r.width() * 0.36;
-            let mut pts = arc(c, rad, 0.35 * PI, 1.65 * PI);
-            let inner = c + vec2(rad * 0.55, -rad * 0.2);
-            let mut back = arc(inner, rad * 0.78, 1.3 * PI, 0.62 * PI);
-            pts.append(&mut back);
-            p.add(Shape::closed_line(pts, s));
-        }
-        Icon::Auto => {
-            let c = r.center();
-            let rad = r.width() * 0.36;
-            p.circle_stroke(c, rad, s);
-            let mut half = arc(c, rad, 0.5 * PI, 1.5 * PI);
-            half.push(c + vec2(0.0, -rad));
-            p.add(Shape::convex_polygon(half, color, Stroke::NONE));
-        }
         Icon::More => {
             for x in [0.22, 0.5, 0.78] {
                 p.circle_filled(at(x, 0.5), 1.6, color);
@@ -169,6 +159,56 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
             p.line_segment([at(0.45, 0.55), at(0.85, 0.15)], s);
             p.add(Shape::line(vec![at(0.58, 0.15), at(0.85, 0.15), at(0.85, 0.42)], s));
         }
+        _ => {}
+    }
+}
+
+fn paint_more(p: &Painter, r: Rect, icon: Icon, s: Stroke) {
+    let at = |x: f32, y: f32| pos2(r.left() + x * r.width(), r.top() + y * r.height());
+    match icon {
+        Icon::Gear => {
+            let c = r.center();
+            let (outer, inner) = (r.width() * 0.44, r.width() * 0.32);
+            let mut pts = Vec::new();
+            for i in 0..8 {
+                let a = i as f32 * TAU / 8.0;
+                for (da, rad) in [(-0.2, inner), (-0.12, outer), (0.12, outer), (0.2, inner)] {
+                    let aa = a + da;
+                    pts.push(c + vec2(aa.cos(), aa.sin()) * rad);
+                }
+            }
+            p.add(Shape::closed_line(pts, s));
+            p.circle_stroke(c, r.width() * 0.13, s);
+        }
+        Icon::FolderOpen => {
+            p.add(Shape::line(
+                vec![at(0.1, 0.8), at(0.06, 0.2), at(0.4, 0.2), at(0.5, 0.32), at(0.82, 0.32), at(0.82, 0.44)],
+                s,
+            ));
+            p.add(Shape::closed_line(vec![at(0.06, 0.82), at(0.22, 0.44), at(0.98, 0.44), at(0.82, 0.82)], s));
+        }
+        Icon::Collapse => {
+            p.add(Shape::line(vec![at(0.25, 0.48), at(0.5, 0.25), at(0.75, 0.48)], s));
+            p.add(Shape::line(vec![at(0.25, 0.78), at(0.5, 0.55), at(0.75, 0.78)], s));
+        }
+        Icon::ChevronLeft => {
+            p.add(Shape::line(vec![at(0.62, 0.22), at(0.34, 0.5), at(0.62, 0.78)], s));
+        }
+        Icon::FitPage => {
+            p.rect_stroke(Rect::from_min_max(at(0.24, 0.08), at(0.76, 0.92)), 1.5, s, egui::StrokeKind::Middle);
+            p.add(Shape::line(vec![at(0.4, 0.3), at(0.5, 0.2), at(0.6, 0.3)], s));
+            p.add(Shape::line(vec![at(0.4, 0.7), at(0.5, 0.8), at(0.6, 0.7)], s));
+        }
+        Icon::Spread => {
+            p.rect_stroke(Rect::from_min_max(at(0.04, 0.18), at(0.48, 0.82)), 1.5, s, egui::StrokeKind::Middle);
+            p.rect_stroke(Rect::from_min_max(at(0.52, 0.18), at(0.96, 0.82)), 1.5, s, egui::StrokeKind::Middle);
+        }
+        Icon::Thumbnails => {
+            for (x, y) in [(0.1, 0.1), (0.56, 0.1), (0.1, 0.56), (0.56, 0.56)] {
+                p.rect_stroke(Rect::from_min_size(at(x, y), r.size() * 0.34), 1.5, s, egui::StrokeKind::Middle);
+            }
+        }
+        _ => {}
     }
 }
 

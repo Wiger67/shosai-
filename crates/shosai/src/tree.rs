@@ -1,17 +1,23 @@
-//! 側欄的檔案樹：自繪的列（圖示、縮排、整列 hover / 選取），取代 egui 預設的折疊標題。
+//! 側欄的檔案樹：自繪的列。
+//!
+//! 為了讓結構一眼就看得懂：
+//! - 不同類型用不同顏色的圖示（資料夾、書本、Markdown、PDF）
+//! - 展開的資料夾畫出縮排導引線
+//! - 資料夾與書本右側顯示裡面有幾個檔案
+//! - 書本章節用編號徽章標示順序
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use eframe::egui::{self, pos2, vec2, Rect, RichText, Sense, TextWrapMode, Ui, WidgetText};
+use eframe::egui::{self, pos2, vec2, Color32, Rect, RichText, Sense, Stroke, TextWrapMode, Ui, WidgetText};
 use shosai_core::{Book, Entry, EntryKind};
 
 use crate::app::{Action, Dialog, Format};
 use crate::icons::{self, Icon};
 use crate::theme::Palette;
 
-const ROW_H: f32 = 26.0;
-const INDENT: f32 = 14.0;
+const ROW_H: f32 = 28.0;
+const INDENT: f32 = 16.0;
 
 pub struct TreeCtx<'a> {
     pub current: Option<&'a Path>,
@@ -19,47 +25,96 @@ pub struct TreeCtx<'a> {
     pub actions: &'a mut Vec<Action>,
     pub expanded: &'a mut HashSet<PathBuf>,
     pub pal: Palette,
+    pub show_pdfs: bool,
+    pub show_counts: bool,
+    pub lib_root: &'a Path,
 }
 
-/// 一列：縮排、展開箭頭（資料夾才有）、圖示、文字。
-fn row(
-    ui: &mut Ui,
+struct RowSpec<'a> {
     depth: usize,
     chevron: Option<bool>,
-    icon: Option<Icon>,
-    text: impl Into<WidgetText>,
+    icon: Option<(Icon, Color32)>,
+    /// 章節編號徽章
+    badge: Option<String>,
+    text: WidgetText,
+    /// 右側的淡色資訊（檔案數）
+    trailing: Option<String>,
     selected: bool,
-    pal: &Palette,
-) -> egui::Response {
+    /// 目前檔案所在的資料夾：箭頭用強調色
+    on_path: bool,
+    hover: Option<&'a str>,
+}
+
+fn row(ui: &mut Ui, spec: RowSpec, pal: &Palette) -> egui::Response {
     let width = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::click());
+    let (rect, mut resp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::click());
+    if let Some(h) = spec.hover {
+        resp = resp.on_hover_text(h);
+    }
     if !ui.is_rect_visible(rect) {
         return resp;
     }
     let p = ui.painter();
-    if selected {
+    if spec.selected {
         p.rect_filled(rect, 6.0, pal.selected);
+        // 左側強調條
+        let bar = Rect::from_min_size(rect.min + vec2(0.0, 6.0), vec2(3.0, rect.height() - 12.0));
+        p.rect_filled(bar, 1.5, pal.accent);
     } else if resp.hovered() {
         p.rect_filled(rect, 6.0, pal.hover);
     }
-    let fg = if selected { pal.ink } else { ui.visuals().text_color() };
-    let mut x = rect.left() + 6.0 + depth as f32 * INDENT;
+
+    let mut x = rect.left() + 8.0 + spec.depth as f32 * INDENT;
     let cy = rect.center().y;
-    if let Some(open) = chevron {
-        let r = Rect::from_center_size(pos2(x + 6.0, cy), vec2(11.0, 11.0));
-        icons::paint(p, r, if open { Icon::ChevronDown } else { Icon::ChevronRight }, pal.weak);
+    if let Some(open) = spec.chevron {
+        let r = Rect::from_center_size(pos2(x + 5.0, cy), vec2(10.0, 10.0));
+        let color = if spec.on_path { pal.accent } else { pal.weak };
+        icons::paint(p, r, if open { Icon::ChevronDown } else { Icon::ChevronRight }, color);
     }
     x += 14.0;
-    if let Some(icon) = icon {
-        let r = Rect::from_center_size(pos2(x + 8.0, cy), vec2(15.0, 15.0));
-        icons::paint(p, r, icon, if selected { pal.accent } else { pal.weak });
-        x += 22.0;
+    if let Some((icon, color)) = spec.icon {
+        let r = Rect::from_center_size(pos2(x + 8.0, cy), vec2(16.0, 16.0));
+        icons::paint(p, r, icon, color);
+        x += 23.0;
     }
-    let max_w = (rect.right() - x - 6.0).max(10.0);
-    let galley = text.into().into_galley(ui, Some(TextWrapMode::Truncate), max_w, egui::TextStyle::Body);
-    let pos = pos2(x, cy - galley.size().y / 2.0);
-    ui.painter().galley(pos, galley, fg);
+    if let Some(badge) = &spec.badge {
+        let font = egui::FontId::proportional(11.0);
+        let color = if spec.selected { pal.accent } else { pal.weak };
+        let galley = p.layout_no_wrap(badge.clone(), font, color);
+        let w = galley.size().x.max(10.0) + 10.0;
+        let r = Rect::from_center_size(pos2(x + w / 2.0, cy), vec2(w, 18.0));
+        p.rect_stroke(
+            r,
+            5.0,
+            Stroke::new(1.0, if spec.selected { pal.accent } else { pal.guide }),
+            egui::StrokeKind::Inside,
+        );
+        p.galley(r.center() - galley.size() / 2.0, galley, color);
+        x += w + 8.0;
+    }
+
+    let mut right = rect.right() - 8.0;
+    if let Some(t) = &spec.trailing {
+        let galley = p.layout_no_wrap(t.clone(), egui::FontId::proportional(11.5), pal.weak);
+        right -= galley.size().x;
+        p.galley(pos2(right, cy - galley.size().y / 2.0), galley, pal.weak);
+        right -= 8.0;
+    }
+
+    let fg = if spec.selected { pal.ink } else { ui.visuals().text_color() };
+    let max_w = (right - x).max(10.0);
+    let galley = spec.text.into_galley(ui, Some(TextWrapMode::Truncate), max_w, egui::TextStyle::Body);
+    ui.painter().galley(pos2(x, cy - galley.size().y / 2.0), galley, fg);
     resp
+}
+
+/// 縮排導引線：從 `top` 畫到 `bottom`，位置對齊上層的展開箭頭。
+fn guide(ui: &Ui, left: f32, depth: usize, top: f32, bottom: f32, pal: &Palette) {
+    if bottom - top < 2.0 {
+        return;
+    }
+    let x = left + 8.0 + depth as f32 * INDENT + 5.0;
+    ui.painter().vline(x, top + 2.0..=bottom - 4.0, Stroke::new(1.0, pal.guide));
 }
 
 fn toggle(expanded: &mut HashSet<PathBuf>, path: &Path) {
@@ -68,14 +123,44 @@ fn toggle(expanded: &mut HashSet<PathBuf>, path: &Path) {
     }
 }
 
+fn count_files(list: &[Entry], pdfs: bool) -> usize {
+    list.iter()
+        .map(|e| match e.kind {
+            EntryKind::Markdown => 1,
+            EntryKind::Pdf => usize::from(pdfs),
+            _ => count_files(&e.children, pdfs),
+        })
+        .sum()
+}
+
+fn rel(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned()
+}
+
 /// 一般資料夾內容。
 pub fn entries(ui: &mut Ui, list: &[Entry], depth: usize, cx: &mut TreeCtx) {
     for e in list {
         match e.kind {
-            EntryKind::Markdown | EntryKind::Pdf => file(ui, e, depth, cx),
+            EntryKind::Markdown => file(ui, e, depth, cx),
+            EntryKind::Pdf if cx.show_pdfs => file(ui, e, depth, cx),
+            EntryKind::Pdf => {}
             EntryKind::Dir => {
                 let open = cx.expanded.contains(&e.path);
-                let resp = row(ui, depth, Some(open), Some(Icon::Folder), e.name.as_str(), false, &cx.pal);
+                let on_path = cx.current.is_some_and(|c| c.starts_with(&e.path));
+                let count = count_files(&e.children, cx.show_pdfs);
+                let hover = rel(&e.path, cx.lib_root);
+                let spec = RowSpec {
+                    depth,
+                    chevron: Some(open),
+                    icon: Some((if open { Icon::FolderOpen } else { Icon::Folder }, cx.pal.folder)),
+                    badge: None,
+                    text: RichText::new(&e.name).color(cx.pal.ink).into(),
+                    trailing: (cx.show_counts && count > 0).then(|| count.to_string()),
+                    selected: false,
+                    on_path,
+                    hover: Some(&hover),
+                };
+                let resp = row(ui, spec, &cx.pal);
                 if resp.clicked() {
                     toggle(cx.expanded, &e.path);
                 }
@@ -85,25 +170,32 @@ pub fn entries(ui: &mut Ui, list: &[Entry], depth: usize, cx: &mut TreeCtx) {
                     common_menu(ui, &e.path, cx.actions);
                 });
                 if open {
-                    if e.children.is_empty() {
-                        row(ui, depth + 1, None, None, RichText::new("（空資料夾）").weak(), false, &cx.pal);
+                    let left = ui.available_rect_before_wrap().left();
+                    let top = ui.cursor().top();
+                    if count == 0 && e.children.iter().all(|c| c.kind != EntryKind::Dir && c.kind != EntryKind::Book) {
+                        empty_row(ui, depth + 1, "（沒有檔案）", &cx.pal);
                     }
                     entries(ui, &e.children, depth + 1, cx);
+                    guide(ui, left, depth, top, ui.cursor().top(), &cx.pal);
                 }
             }
             EntryKind::Book => {
                 let Some(book) = cx.books.get(&e.path) else { continue };
                 let open = cx.expanded.contains(&e.path);
-                let resp = row(
-                    ui,
+                let on_path = cx.current.is_some_and(|c| c.starts_with(&e.path));
+                let hover = format!("{}　（{} 章）", rel(&e.path, cx.lib_root), book.chapters.len());
+                let spec = RowSpec {
                     depth,
-                    Some(open),
-                    Some(Icon::Book),
-                    RichText::new(&book.meta.title).strong(),
-                    false,
-                    &cx.pal,
-                )
-                .on_hover_text(e.path.display().to_string());
+                    chevron: Some(open),
+                    icon: Some((Icon::Book, cx.pal.book)),
+                    badge: None,
+                    text: RichText::new(&book.meta.title).strong().color(cx.pal.ink).into(),
+                    trailing: cx.show_counts.then(|| format!("{} 章", book.chapters.len())),
+                    selected: false,
+                    on_path,
+                    hover: Some(&hover),
+                };
+                let resp = row(ui, spec, &cx.pal);
                 if resp.clicked() {
                     toggle(cx.expanded, &e.path);
                 }
@@ -113,24 +205,48 @@ pub fn entries(ui: &mut Ui, list: &[Entry], depth: usize, cx: &mut TreeCtx) {
                     common_menu(ui, &e.path, cx.actions);
                 });
                 if open {
+                    let left = ui.available_rect_before_wrap().left();
+                    let top = ui.cursor().top();
                     book_contents(ui, book, e, depth + 1, cx);
+                    guide(ui, left, depth, top, ui.cursor().top(), &cx.pal);
                 }
             }
         }
     }
 }
 
-/// 書本內容：依章節順序列出，再列出書中的 PDF（例如輸出的成品）。
+fn empty_row(ui: &mut Ui, depth: usize, text: &str, pal: &Palette) {
+    let spec = RowSpec {
+        depth,
+        chevron: None,
+        icon: None,
+        badge: None,
+        text: RichText::new(text).small().color(pal.weak).into(),
+        trailing: None,
+        selected: false,
+        on_path: false,
+        hover: None,
+    };
+    row(ui, spec, pal);
+}
+
+/// 書本內容：依章節順序列出（編號徽章），再列出書中的 PDF（例如輸出的成品）。
 pub fn book_contents(ui: &mut Ui, book: &Book, entry: &Entry, depth: usize, cx: &mut TreeCtx) {
     let n = book.chapters.len();
-    let weak = cx.pal.weak;
     for (i, ch) in book.chapters.iter().enumerate() {
         let selected = cx.current == Some(ch.path.as_path());
-        let mut job = egui::text::LayoutJob::default();
-        let body = ui.style().text_styles[&egui::TextStyle::Body].clone();
-        job.append(&format!("{:>2}  ", i + 1), 0.0, egui::TextFormat::simple(body.clone(), weak));
-        job.append(&ch.title, 0.0, egui::TextFormat::simple(body, ui.visuals().text_color()));
-        let resp = row(ui, depth, None, None, job, selected, &cx.pal).on_hover_text(&ch.rel);
+        let spec = RowSpec {
+            depth,
+            chevron: None,
+            icon: None,
+            badge: Some(format!("{}", i + 1)),
+            text: ch.title.clone().into(),
+            trailing: None,
+            selected,
+            on_path: false,
+            hover: Some(&ch.rel),
+        };
+        let resp = row(ui, spec, &cx.pal);
         if resp.clicked() && !selected {
             cx.actions.push(Action::Open(ch.path.clone()));
         }
@@ -144,16 +260,33 @@ pub fn book_contents(ui: &mut Ui, book: &Book, entry: &Entry, depth: usize, cx: 
                 ui.close();
             }
             ui.separator();
+            if ui.button("輸出這一章為 PDF…").clicked() {
+                cx.actions.push(Action::Export { source: ch.path.clone(), format: Format::Pdf });
+                ui.close();
+            }
+            ui.separator();
             common_menu(ui, &ch.path, cx.actions);
         });
     }
-    let mut pdfs = Vec::new();
-    collect_pdfs(&entry.children, &mut pdfs);
-    for pdf in pdfs {
-        file(ui, pdf, depth, cx);
+    if cx.show_pdfs {
+        let mut pdfs = Vec::new();
+        collect_pdfs(&entry.children, &mut pdfs);
+        for pdf in pdfs {
+            file(ui, pdf, depth, cx);
+        }
     }
-    let resp = row(ui, depth, None, Some(Icon::Plus), RichText::new("新增章節").color(weak), false, &cx.pal);
-    if resp.clicked() {
+    let spec = RowSpec {
+        depth,
+        chevron: None,
+        icon: Some((Icon::Plus, cx.pal.weak)),
+        badge: None,
+        text: RichText::new("新增章節").color(cx.pal.weak).into(),
+        trailing: None,
+        selected: false,
+        on_path: false,
+        hover: None,
+    };
+    if row(ui, spec, &cx.pal).clicked() {
         cx.actions.push(Action::Dialog(Dialog::NewChapter { book: book.root.clone(), title: String::new() }));
     }
 }
@@ -176,25 +309,34 @@ pub fn file(ui: &mut Ui, e: &Entry, depth: usize, cx: &mut TreeCtx) {
 pub fn file_labeled(ui: &mut Ui, path: &Path, name: &str, is_pdf: bool, depth: usize, cx: &mut TreeCtx) {
     let selected = cx.current == Some(path);
     let label = if is_pdf { name.to_string() } else { name.trim_end_matches(".md").to_string() };
-    let icon = if is_pdf { Icon::Pdf } else { Icon::File };
-    let resp = row(ui, depth, None, Some(icon), label, selected, &cx.pal);
+    let (icon, color) = if is_pdf { (Icon::Pdf, cx.pal.pdf) } else { (Icon::File, cx.pal.markdown) };
+    let hover = rel(path, cx.lib_root);
+    let spec = RowSpec {
+        depth,
+        chevron: None,
+        icon: Some((icon, color)),
+        badge: None,
+        text: label.into(),
+        trailing: None,
+        selected,
+        on_path: false,
+        hover: Some(&hover),
+    };
+    let resp = row(ui, spec, &cx.pal);
     if resp.clicked() && !selected {
         cx.actions.push(Action::Open(path.to_path_buf()));
     }
     resp.context_menu(|ui| {
-        if !is_pdf {
-            if ui.button("輸出 PDF…").clicked() {
-                cx.actions.push(Action::Export { source: path.to_path_buf(), format: Format::Pdf });
-                ui.close();
-            }
-            ui.separator();
-        } else {
+        if is_pdf {
             if ui.button("用預設程式開啟").clicked() {
                 cx.actions.push(Action::Reveal(path.to_path_buf()));
                 ui.close();
             }
-            ui.separator();
+        } else if ui.button("輸出 PDF…").clicked() {
+            cx.actions.push(Action::Export { source: path.to_path_buf(), format: Format::Pdf });
+            ui.close();
         }
+        ui.separator();
         common_menu(ui, path, cx.actions);
     });
 }
