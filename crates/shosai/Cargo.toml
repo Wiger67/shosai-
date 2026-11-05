@@ -14,6 +14,10 @@ rfd = "0.15"
 # PDF 檢視（已是 Typst 的相依套件，不會額外增加體積）
 hayro = { version = "0.7", optional = true }
 
+[build-dependencies]
+# 嵌入 Windows exe 圖示（只在編譯 Windows 版時使用）
+winresource = "0.1"
+
 [features]
 default = ["pdf"]
 # 內嵌 Typst PDF 引擎（關閉可縮小執行檔，改用系統的 typst 指令）

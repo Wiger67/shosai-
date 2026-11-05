@@ -1,3 +1,5 @@
+<p align="center"><img src="crates/shosai/assets/shosai.png" width="112" alt="書齋圖示"></p>
+
 # 書齋 Shosai
 
 用 Rust 寫的**輕量 Markdown 寫作與閱讀器**：把資料夾整理成一本書，像翻書一樣閱讀，一鍵排版成 PDF。
@@ -39,6 +41,8 @@ HackMD 語法與 LaTeX 數學式（閱讀模式）：
 ```bash
 cargo build --release
 ```
+
+Windows 版的 exe 會內嵌程式圖示與版本資訊（`crates/shosai/build.rs`，圖示原始檔為 `crates/shosai/assets/shosai.svg`）。
 
 執行檔在 `target/release/shosai`（Windows 為 `target\release\shosai.exe`），單一檔案、可直接複製使用。
 

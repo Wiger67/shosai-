@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- 書齋 Shosai 圖示：暖棕色底、一本打開的書、紅色書籤 -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#b0703f"/>
+      <stop offset="1" stop-color="#7a4321"/>
+    </linearGradient>
+    <linearGradient id="pageL" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#fdf6e9"/>
+      <stop offset="1" stop-color="#e8d8bc"/>
+    </linearGradient>
+    <linearGradient id="pageR" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#e8d8bc"/>
+      <stop offset="1" stop-color="#fdf6e9"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#bg)"/>
+  <!-- 書的陰影 -->
+  <path d="M38 186 Q128 168 218 186 L218 202 Q128 184 38 202 Z" fill="#4e2812" opacity="0.45"/>
+  <!-- 左頁、右頁 -->
+  <path d="M128 80 Q90 60 44 66 L44 184 Q90 178 128 198 Z" fill="url(#pageL)"/>
+  <path d="M128 80 Q166 60 212 66 L212 184 Q166 178 128 198 Z" fill="url(#pageR)"/>
+  <path d="M128 80 L128 198" stroke="#c4a87c" stroke-width="3"/>
+  <!-- 文字行 -->
+  <g stroke="#b89a6e" stroke-width="7" stroke-linecap="round" fill="none">
+    <path d="M62 98 Q86 94 110 102"/>
+    <path d="M62 120 Q86 116 110 124"/>
+    <path d="M62 142 Q86 138 110 146"/>
+    <path d="M62 164 Q80 161 96 166"/>
+    <path d="M146 102 Q170 94 194 98"/>
+    <path d="M146 124 Q170 116 194 120"/>
+  </g>
+  <!-- 書籤 -->
+  <path d="M152 66 L152 160 L164 148 L176 160 L176 62 Q164 62 152 66 Z" fill="#c8453a"/>
+  <path d="M152 66 L152 160 L158 154 L158 65 Z" fill="#a33328"/>
+</svg>

@@ -22,10 +22,16 @@ pub fn run(open: Option<PathBuf>) -> eframe::Result {
             .with_title("書齋")
             .with_app_id("shosai")
             .with_inner_size([1180.0, 760.0])
-            .with_min_inner_size([520.0, 360.0]),
+            .with_min_inner_size([520.0, 360.0])
+            .with_icon(app_icon()),
         ..Default::default()
     };
     eframe::run_native("shosai", options, Box::new(move |cc| Ok(Box::new(ShosaiApp::new(cc, open)))))
+}
+
+/// 視窗 / 工作列圖示。
+fn app_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/shosai.png")).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
