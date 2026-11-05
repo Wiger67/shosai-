@@ -20,6 +20,9 @@ const HELP: &str = "書齋 Shosai — 輕量 Markdown 寫作與閱讀器
 pub fn run(args: &[String]) -> Option<i32> {
     let cmd = args.first()?.as_str();
     let rest = &args[1..];
+    if matches!(cmd, "-h" | "--help" | "help" | "-V" | "--version" | "export" | "new-book" | "sync") {
+        attach_console();
+    }
     let result = match cmd {
         "-h" | "--help" | "help" => {
             print!("{HELP}");
@@ -42,6 +45,23 @@ pub fn run(args: &[String]) -> Option<i32> {
         }
     })
 }
+
+/// Windows release 版是 GUI 程式（沒有主控台），命令列模式時接回呼叫端的主控台，
+/// 否則 `shosai export` 等指令的輸出訊息會看不到。
+#[cfg(windows)]
+fn attach_console() {
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+    // SAFETY: Win32 API，沒有指標參數；失敗（例如已有主控台）時不做任何事。
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_console() {}
 
 fn export_cmd(args: &[String]) -> Result<(), String> {
     let mut input = None;

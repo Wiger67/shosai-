@@ -26,7 +26,15 @@
 cargo build --release
 ```
 
-執行檔在 `target/release/shosai`（Windows 為 `shosai.exe`），單一檔案、可直接複製使用。
+執行檔在 `target/release/shosai`（Windows 為 `target\release\shosai.exe`），單一檔案、可直接複製使用。
+
+> **Windows 注意**：命令提示字元（cmd）不認得 `./` 開頭的路徑，要用反斜線：
+>
+> ```bat
+> .\target\release\shosai.exe examples\範例書
+> ```
+>
+> 或直接把 `examples\範例書` 資料夾拖到 `shosai.exe` 上。
 
 可選功能（cargo features）：
 
