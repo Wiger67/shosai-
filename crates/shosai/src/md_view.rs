@@ -92,8 +92,8 @@ impl MdView {
             ui.spacing_mut().item_spacing.y = cx.body * 0.6;
             blocks(ui, &doc.blocks, &mut cx);
             if !doc.footnotes.is_empty() {
-                ui.add_space(cx.body);
-                ui.separator();
+                ui.add_space(cx.body * 1.5);
+                ui.label(RichText::new("註腳").size(cx.body * 0.8).weak());
                 for f in &doc.footnotes {
                     let id = format!("fn-{}", f.number);
                     ui.horizontal_top(|ui| {
@@ -153,9 +153,6 @@ fn block(ui: &mut egui::Ui, b: &Block, cx: &mut Ctx) {
                 })
                 .response;
             scroll_if_target(&resp, id, cx.scroll_to);
-            if *level <= 2 {
-                ui.add(egui::Separator::default().spacing(2.0));
-            }
         }
         Block::Quote(bs) => {
             let color = ui.visuals().weak_text_color();
@@ -179,6 +176,8 @@ fn block(ui: &mut egui::Ui, b: &Block, cx: &mut Ctx) {
         }
         Block::List { start, items } => {
             cx.list_depth += 1;
+            let old_spacing = ui.spacing().item_spacing.y;
+            ui.spacing_mut().item_spacing.y = body * 0.2;
             let bullet = ["•", "◦", "▪"][(cx.list_depth - 1) % 3];
             for (i, item) in items.iter().enumerate() {
                 let is_task =
@@ -198,14 +197,15 @@ fn block(ui: &mut egui::Ui, b: &Block, cx: &mut Ctx) {
                 });
             }
             cx.list_depth -= 1;
+            ui.spacing_mut().item_spacing.y = old_spacing;
         }
         Block::Table { aligns, header, rows } => {
             egui::Frame::new()
-                .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-                .corner_radius(3.0)
-                .inner_margin(4.0)
+                .fill(ui.visuals().faint_bg_color)
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(10, 6))
                 .show(ui, |ui| {
-                    egui::Grid::new(ui.next_auto_id()).striped(true).spacing([body, body * 0.4]).show(ui, |ui| {
+                    egui::Grid::new(ui.next_auto_id()).striped(false).spacing([body, body * 0.4]).show(ui, |ui| {
                         for (i, cell) in header.iter().enumerate() {
                             table_cell(ui, cell, aligns.get(i), true, cx);
                         }
@@ -220,7 +220,14 @@ fn block(ui: &mut egui::Ui, b: &Block, cx: &mut Ctx) {
                 });
         }
         Block::Rule => {
-            ui.separator();
+            // 分隔線：置中的短線，而非整行
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), body), egui::Sense::hover());
+            let c = rect.center();
+            let half = (rect.width() * 0.15).min(80.0);
+            ui.painter().line_segment(
+                [egui::pos2(c.x - half, c.y), egui::pos2(c.x + half, c.y)],
+                Stroke::new(1.0, ui.visuals().weak_text_color()),
+            );
         }
         Block::Container { kind: ContainerKind::Spoiler, title, open, blocks: bs } => {
             let title = if title.is_empty() { "詳細內容" } else { title.as_str() };
@@ -233,8 +240,8 @@ fn block(ui: &mut egui::Ui, b: &Block, cx: &mut Ctx) {
             let (bg, border, fg) = container_colors(*kind, ui.visuals().dark_mode);
             egui::Frame::new()
                 .fill(bg)
-                .stroke(Stroke::new(1.0, border))
-                .corner_radius(4.0)
+                .stroke(Stroke::new(1.0, border.gamma_multiply(0.6)))
+                .corner_radius(6.0)
                 .inner_margin(egui::Margin::symmetric(12, 9))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -260,11 +267,12 @@ fn block(ui: &mut egui::Ui, b: &Block, cx: &mut Ctx) {
             let headings = cx.doc.headings();
             let min = headings.iter().map(|h| h.level).min().unwrap_or(1);
             egui::Frame::new()
-                .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-                .corner_radius(4.0)
-                .inner_margin(egui::Margin::symmetric(12, 8))
+                .fill(ui.visuals().faint_bg_color)
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(14, 10))
                 .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(RichText::new("目錄").size(body * 0.8).weak());
+                    ui.spacing_mut().item_spacing.y = 3.0;
                     for h in headings {
                         ui.horizontal(|ui| {
                             ui.add_space((h.level - min) as f32 * body * 1.2);
@@ -276,8 +284,8 @@ fn block(ui: &mut egui::Ui, b: &Block, cx: &mut Ctx) {
                 });
         }
         Block::PageBreak => {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("┄┄┄ 分頁 ┄┄┄").weak().small());
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("· 分頁 ·").weak().small());
             });
         }
         Block::Html(_) => {}
@@ -311,7 +319,12 @@ fn table_cell(ui: &mut egui::Ui, cell: &[Inline], align: Option<&CellAlign>, hea
         _ => egui::Layout::top_down(Align::Min),
     };
     ui.with_layout(layout, |ui| {
-        paragraph(ui, cell, cx, Style { strong: header, ..Style::default() });
+        // 表格儲存格不自動換行，讓欄寬依內容決定
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            inlines(ui, cell, cx, &Style { strong: header, ..Style::default() });
+        });
     });
 }
 
@@ -319,7 +332,7 @@ fn code_block(ui: &mut egui::Ui, lang: &str, code: &str, line_start: Option<usiz
     let theme = egui_extras::syntax_highlighting::CodeTheme::from_style(ui.style());
     egui::Frame::new()
         .fill(ui.visuals().code_bg_color)
-        .corner_radius(4.0)
+        .corner_radius(6.0)
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -401,7 +414,7 @@ fn text(ui: &mut egui::Ui, t: &str, cx: &mut Ctx, style: &Style) {
             }
         }
         None => {
-            ui.add(egui::Label::new(rich).wrap());
+            ui.add(egui::Label::new(rich));
         }
     }
 }
@@ -416,7 +429,7 @@ fn inline(ui: &mut egui::Ui, x: &Inline, cx: &mut Ctx, style: &Style) {
         Inline::Text(t) => text(ui, t, cx, style),
         Inline::Code(t) => {
             let size = style.size.unwrap_or(cx.body) * 0.9;
-            ui.add(egui::Label::new(RichText::new(t).code().size(size)).wrap());
+            ui.add(egui::Label::new(RichText::new(t).code().size(size)));
         }
         Inline::Math { tex, display } => {
             if *display {

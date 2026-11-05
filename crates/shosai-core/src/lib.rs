@@ -48,6 +48,11 @@ impl From<std::io::Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// 判斷路徑是否為 PDF 檔。
+pub fn is_pdf(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+}
+
 /// 判斷路徑是否為 Markdown 檔。
 pub fn is_markdown(path: &std::path::Path) -> bool {
     matches!(

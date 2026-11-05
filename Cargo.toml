@@ -13,7 +13,6 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
-panic = "abort"
 
 # 依賴套件以「體積」優先最佳化（對啟動速度幾乎沒影響），自己的程式碼仍用 opt-level 3
 [profile.release.package."*"]

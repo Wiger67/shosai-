@@ -1,6 +1,6 @@
 //! 視窗介面（egui）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
@@ -10,7 +10,11 @@ use serde::{Deserialize, Serialize};
 use shosai_core::book::{is_book, BookMeta};
 use shosai_core::{library, markdown, Book, Entry, EntryKind, Library};
 
+use crate::icons::{self, Icon};
 use crate::md_view::{MdView, ViewEvent};
+use crate::pdf_view::PdfView;
+use crate::theme::{self, Palette};
+use crate::tree::{self, TreeCtx};
 
 const AUTOSAVE_AFTER: Duration = Duration::from_millis(1200);
 
@@ -19,8 +23,8 @@ pub fn run(open: Option<PathBuf>) -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("書齋")
             .with_app_id("shosai")
-            .with_inner_size([1120.0, 740.0])
-            .with_min_inner_size([480.0, 320.0]),
+            .with_inner_size([1180.0, 760.0])
+            .with_min_inner_size([520.0, 360.0]),
         ..Default::default()
     };
     eframe::run_native("shosai", options, Box::new(move |cc| Ok(Box::new(ShosaiApp::new(cc, open)))))
@@ -49,6 +53,8 @@ struct Settings {
     reader_size: f32,
     reader_width: f32,
     sidebar: bool,
+    /// 側欄中展開的資料夾 / 書本
+    expanded: HashSet<PathBuf>,
 }
 
 impl Default for Settings {
@@ -63,6 +69,7 @@ impl Default for Settings {
             reader_size: 17.0,
             reader_width: 720.0,
             sidebar: true,
+            expanded: HashSet::new(),
         }
     }
 }
@@ -78,7 +85,7 @@ struct OpenDoc {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Format {
+pub(crate) enum Format {
     Pdf,
     Html,
     Typst,
@@ -101,7 +108,7 @@ impl Format {
     }
 }
 
-enum Dialog {
+pub(crate) enum Dialog {
     NewNote {
         dir: PathBuf,
         name: String,
@@ -141,10 +148,11 @@ enum Dialog {
     },
     /// 同步結果
     Report(String),
+    Shortcuts,
     About,
 }
 
-enum Action {
+pub(crate) enum Action {
     Open(PathBuf),
     OpenLibrary(PathBuf),
     PickLibrary,
@@ -172,10 +180,12 @@ enum Status {
 }
 
 pub struct ShosaiApp {
+    ctx: egui::Context,
     settings: Settings,
     library: Option<Library>,
     books: HashMap<PathBuf, Book>,
     doc: Option<OpenDoc>,
+    pdf: Option<PdfView>,
     md_view: MdView,
     view_events: Vec<ViewEvent>,
     dialog: Option<Dialog>,
@@ -191,21 +201,16 @@ pub struct ShosaiApp {
 impl ShosaiApp {
     fn new(cc: &eframe::CreationContext<'_>, open: Option<PathBuf>) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        theme::install(&cc.egui_ctx);
         let settings: Settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
 
-        cc.egui_ctx.all_styles_mut(|style| {
-            style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-            style.spacing.button_padding = egui::vec2(8.0, 3.0);
-            style.text_styles.insert(TextStyle::Body, FontId::proportional(14.5));
-            style.text_styles.insert(TextStyle::Button, FontId::proportional(14.0));
-            style.url_in_tooltip = true;
-        });
-
         let mut app = ShosaiApp {
+            ctx: cc.egui_ctx.clone(),
             settings,
             library: None,
             books: HashMap::new(),
             doc: None,
+            pdf: None,
             md_view: MdView::default(),
             view_events: Vec::new(),
             dialog: None,
@@ -293,11 +298,24 @@ impl ShosaiApp {
         }
     }
 
+    /// 開啟檔案：Markdown 進編輯器，PDF 進檢視器。
     fn open_file(&mut self, path: &Path) {
         self.save_current();
+        self.reveal_in_tree(path);
+        if shosai_core::is_pdf(path) {
+            if cfg!(feature = "pdf") {
+                self.doc = None;
+                self.pdf = Some(PdfView::open(path, &self.ctx));
+                self.settings.last_file = Some(path.to_path_buf());
+            } else {
+                open_path(path);
+            }
+            return;
+        }
         match std::fs::read_to_string(path) {
             Ok(text) => {
                 let words = markdown::word_count(&text);
+                self.pdf = None;
                 self.doc = Some(OpenDoc {
                     path: path.to_path_buf(),
                     text,
@@ -311,6 +329,19 @@ impl ShosaiApp {
                 self.md_view = MdView::default();
             }
             Err(e) => self.error(format!("無法開啟 {}：{e}", path.display())),
+        }
+    }
+
+    /// 展開側欄中這個檔案所在的資料夾。
+    fn reveal_in_tree(&mut self, path: &Path) {
+        let Some(root) = self.library.as_ref().map(|l| l.root.clone()) else { return };
+        let mut p = path.parent();
+        while let Some(dir) = p {
+            if !dir.starts_with(&root) || dir == root {
+                break;
+            }
+            self.settings.expanded.insert(dir.to_path_buf());
+            p = dir.parent();
         }
     }
 
@@ -364,6 +395,10 @@ impl ShosaiApp {
         self.books.values().find(|b| b.chapters.iter().any(|c| c.path == path))
     }
 
+    fn current_path(&self) -> Option<&Path> {
+        self.doc.as_ref().map(|d| d.path.as_path()).or(self.pdf.as_ref().map(|p| p.path.as_path()))
+    }
+
     /// 閱讀模式的「上一章 / 下一章」順序：書本章節，否則為同資料夾的檔案。
     fn reading_sequence(&self, path: &Path) -> Vec<(PathBuf, String)> {
         if let Some(book) = self.book_of(path) {
@@ -415,6 +450,20 @@ impl ShosaiApp {
         });
         self.export_job = Some(rx);
         self.status = Some(Status::Working(format!("正在輸出 {}…", format.label())));
+    }
+
+    fn poll_export(&mut self) {
+        let Some(rx) = &self.export_job else { return };
+        let Ok(result) = rx.try_recv() else { return };
+        self.export_job = None;
+        match result {
+            Ok(p) => {
+                // 輸出的 PDF 要出現在側欄
+                self.refresh();
+                self.status = Some(Status::Exported(p));
+            }
+            Err(e) => self.error(e),
+        }
     }
 
     #[cfg(feature = "nextcloud")]
@@ -487,10 +536,11 @@ impl ShosaiApp {
                     } else if url.contains("://") || url.starts_with("mailto:") {
                         ctx.open_url(egui::OpenUrl::new_tab(url));
                     } else if let Some(dir) = self.doc.as_ref().and_then(|d| d.path.parent()) {
-                        // 相對連結：Markdown 檔在書齋中開啟，其他檔案交給系統
+                        // 相對連結：Markdown / PDF 在書齋中開啟，其他檔案交給系統
                         let (file, anchor) = url.split_once('#').unwrap_or((url.as_str(), ""));
                         let target = dir.join(shosai_core::export::percent_decode_pub(file));
-                        if shosai_core::is_markdown(&target) && target.is_file() {
+                        let ours = shosai_core::is_markdown(&target) || shosai_core::is_pdf(&target);
+                        if ours && target.is_file() {
                             self.actions.push(Action::Open(target));
                             if !anchor.is_empty() {
                                 self.md_view.scroll_to(anchor);
@@ -513,12 +563,14 @@ impl ShosaiApp {
                 Action::OpenLibrary(p) => {
                     self.save_current();
                     self.doc = None;
+                    self.pdf = None;
                     self.open_library(&p);
                 }
                 Action::PickLibrary => {
                     if let Some(dir) = rfd::FileDialog::new().set_title("選擇書庫資料夾").pick_folder() {
                         self.save_current();
                         self.doc = None;
+                        self.pdf = None;
                         self.open_library(&dir);
                     }
                 }
@@ -578,11 +630,15 @@ impl ShosaiApp {
             }
         }
         if zoom_in || zoom_out {
-            let d = if zoom_in { 1.0 } else { -1.0 };
-            if self.settings.view == ViewMode::Read {
-                self.settings.reader_size = (self.settings.reader_size + d).clamp(10.0, 40.0);
+            if let Some(pdf) = self.pdf.as_mut() {
+                pdf.zoom_by(if zoom_in { 1.2 } else { 1.0 / 1.2 });
             } else {
-                self.settings.editor_size = (self.settings.editor_size + d).clamp(9.0, 40.0);
+                let d = if zoom_in { 1.0 } else { -1.0 };
+                if self.settings.view == ViewMode::Read {
+                    self.settings.reader_size = (self.settings.reader_size + d).clamp(10.0, 40.0);
+                } else {
+                    self.settings.editor_size = (self.settings.editor_size + d).clamp(9.0, 40.0);
+                }
             }
         }
 
@@ -593,7 +649,7 @@ impl ShosaiApp {
         if let Some(p) = dropped.into_iter().next() {
             if p.is_dir() {
                 self.actions.push(Action::OpenLibrary(p));
-            } else if shosai_core::is_markdown(&p) {
+            } else if shosai_core::is_markdown(&p) || shosai_core::is_pdf(&p) {
                 if self.library.is_none() {
                     if let Some(parent) = p.parent() {
                         self.open_library(parent);
@@ -612,9 +668,8 @@ impl ShosaiApp {
 
     /// 新增檔案時預設放的資料夾。
     fn current_dir(&self) -> Option<PathBuf> {
-        self.doc
-            .as_ref()
-            .and_then(|d| d.path.parent().map(Path::to_path_buf))
+        self.current_path()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
             .or_else(|| self.library.as_ref().map(|l| l.root.clone()))
     }
 
@@ -630,118 +685,216 @@ impl ShosaiApp {
         });
     }
 
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui.selectable_label(self.settings.sidebar, "☰").on_hover_text("側欄 (Ctrl+B)").clicked() {
+    fn toolbar(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        ui.horizontal_centered(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let tip = if self.settings.sidebar { "隱藏側欄 (Ctrl+B)" } else { "顯示側欄 (Ctrl+B)" };
+            if icons::button(ui, Icon::Sidebar, tip).clicked() {
                 self.settings.sidebar = !self.settings.sidebar;
             }
-            ui.separator();
-            ui.selectable_value(&mut self.settings.view, ViewMode::Edit, "✏ 編輯").on_hover_text("Ctrl+1");
-            ui.selectable_value(&mut self.settings.view, ViewMode::Split, "◫ 分割").on_hover_text("Ctrl+2");
-            ui.selectable_value(&mut self.settings.view, ViewMode::Read, "📖 閱讀").on_hover_text("Ctrl+3");
-            ui.separator();
+            ui.add_space(8.0);
 
-            let dirty = self.doc.as_ref().is_some_and(|d| d.dirty);
-            if ui.add_enabled(dirty, egui::Button::new("💾 儲存")).on_hover_text("Ctrl+S（也會自動儲存）").clicked()
-            {
-                self.save_current();
+            if self.doc.is_some() {
+                self.mode_switch(ui);
+            } else if let Some(pdf) = &self.pdf {
+                if pdf.page_count() > 0 {
+                    ui.label(
+                        RichText::new(format!("第 {} / {} 頁", pdf.current + 1, pdf.page_count())).color(pal.weak),
+                    );
+                }
             }
 
-            let current = self.doc.as_ref().map(|d| d.path.clone());
-            let book_root = current.as_ref().and_then(|p| self.book_of(p)).map(|b| b.root.clone());
-            ui.add_enabled_ui(current.is_some() && self.export_job.is_none(), |ui| {
-                ui.menu_button("📤 輸出", |ui| {
-                    for format in [Format::Pdf, Format::Html, Format::Typst] {
-                        if let Some(root) = &book_root {
-                            if ui.button(format!("整本書 → {}", format.label())).clicked() {
-                                self.actions.push(Action::Export { source: root.clone(), format });
-                            }
-                        }
-                        if let Some(p) = &current {
-                            if ui.button(format!("此檔案 → {}", format.label())).clicked() {
-                                self.actions.push(Action::Export { source: p.clone(), format });
-                            }
-                        }
-                        ui.separator();
-                    }
-                });
-            });
-
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("ⓘ").on_hover_text("關於").clicked() {
-                    self.dialog = Some(Dialog::About);
-                }
+                ui.spacing_mut().item_spacing.x = 2.0;
+                self.more_menu(ui);
                 let (icon, next, tip) = match self.settings.dark {
-                    None => ("◐", Some(true), "主題：跟隨系統"),
-                    Some(true) => ("🌙", Some(false), "主題：深色"),
-                    Some(false) => ("☀", None, "主題：淺色"),
+                    None => (Icon::Auto, Some(false), "主題：跟隨系統"),
+                    Some(false) => (Icon::Sun, Some(true), "主題：淺色"),
+                    Some(true) => (Icon::Moon, None, "主題：深色"),
                 };
-                if ui.button(icon).on_hover_text(tip).clicked() {
+                if icons::button(ui, icon, tip).clicked() {
                     self.settings.dark = next;
                 }
-                let reading = self.settings.view == ViewMode::Read;
-                let size = if reading { &mut self.settings.reader_size } else { &mut self.settings.editor_size };
-                if ui.button("A+").on_hover_text("放大字體 (Ctrl+=)").clicked() {
-                    *size = (*size + 1.0).min(40.0);
-                }
-                ui.label(RichText::new(format!("{size:.0}")).weak());
-                if ui.button("A−").on_hover_text("縮小字體 (Ctrl+-)").clicked() {
-                    *size = (*size - 1.0).max(9.0);
+                ui.add_space(6.0);
+
+                if let Some(pdf) = self.pdf.as_mut() {
+                    if icons::button(ui, Icon::External, "用預設程式開啟").clicked() {
+                        self.actions.push(Action::Reveal(pdf.path.clone()));
+                    }
+                    if icons::button(ui, Icon::FitWidth, "符合寬度").clicked() {
+                        pdf.fit_width();
+                    }
+                    if icons::button(ui, Icon::Plus, "放大 (Ctrl+=)").clicked() {
+                        pdf.zoom_by(1.2);
+                    }
+                    ui.label(RichText::new(format!("{:.0}%", pdf.effective_zoom() * 100.0)).color(pal.weak));
+                    if icons::button(ui, Icon::Minus, "縮小 (Ctrl+-)").clicked() {
+                        pdf.zoom_by(1.0 / 1.2);
+                    }
+                } else if self.doc.is_some() {
+                    self.export_menu(ui);
+                    ui.add_space(6.0);
+                    let reading = self.settings.view == ViewMode::Read;
+                    let size = if reading { &mut self.settings.reader_size } else { &mut self.settings.editor_size };
+                    if icons::button(ui, Icon::Plus, "放大字體 (Ctrl+=)").clicked() {
+                        *size = (*size + 1.0).min(40.0);
+                    }
+                    ui.label(RichText::new(format!("{size:.0}")).color(pal.weak));
+                    if icons::button(ui, Icon::Minus, "縮小字體 (Ctrl+-)").clicked() {
+                        *size = (*size - 1.0).max(9.0);
+                    }
                 }
             });
         });
     }
 
-    fn status_bar(&mut self, ui: &mut egui::Ui) {
-        if let Some(rx) = &self.export_job {
-            if let Ok(result) = rx.try_recv() {
-                self.export_job = None;
-                self.status = Some(match result {
-                    Ok(p) => Status::Exported(p),
-                    Err(e) => Status::Error(e, Instant::now()),
-                });
-            }
-        }
-
-        ui.horizontal(|ui| {
-            if let Some(doc) = self.doc.as_mut() {
-                if doc.words_stale && doc.last_edit.elapsed() > Duration::from_millis(400) {
-                    doc.words = markdown::word_count(&doc.text);
-                    doc.words_stale = false;
+    /// 編輯 / 分割 / 閱讀 的分段切換。
+    fn mode_switch(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new().fill(ui.visuals().faint_bg_color).corner_radius(8).inner_margin(2).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (mode, label, key) in [
+                (ViewMode::Edit, "編輯", "Ctrl+1"),
+                (ViewMode::Split, "分割", "Ctrl+2"),
+                (ViewMode::Read, "閱讀", "Ctrl+3"),
+            ] {
+                let selected = self.settings.view == mode;
+                let text = if selected { RichText::new(label).strong() } else { RichText::new(label) };
+                let btn = egui::Button::selectable(selected, text).corner_radius(6).min_size(egui::vec2(52.0, 24.0));
+                if ui.add(btn).on_hover_text(key).clicked() {
+                    self.settings.view = mode;
                 }
-                let name = doc.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                ui.label(RichText::new(name).strong());
-                ui.label(RichText::new(if doc.dirty { "● 未儲存" } else { "✔ 已儲存" }).weak());
-                ui.label(RichText::new(format!("{} 字", doc.words)).weak());
+            }
+        });
+    }
+
+    fn export_menu(&mut self, ui: &mut egui::Ui) {
+        let resp = icons::button(ui, Icon::Export, "輸出");
+        let current = self.doc.as_ref().map(|d| d.path.clone());
+        let book_root = current.as_ref().and_then(|p| self.book_of(p)).map(|b| b.root.clone());
+        let busy = self.export_job.is_some();
+        egui::Popup::menu(&resp).show(|ui| {
+            ui.set_min_width(170.0);
+            if busy {
+                ui.label(RichText::new("輸出進行中…").weak());
+                return;
+            }
+            if let Some(root) = &book_root {
+                ui.label(RichText::new("整本書").weak().small());
+                for format in [Format::Pdf, Format::Html, Format::Typst] {
+                    if ui.button(format!("{}…", format.label())).clicked() {
+                        self.actions.push(Action::Export { source: root.clone(), format });
+                        ui.close();
+                    }
+                }
+                ui.add_space(4.0);
+            }
+            if let Some(p) = &current {
+                ui.label(RichText::new("這個檔案").weak().small());
+                for format in [Format::Pdf, Format::Html, Format::Typst] {
+                    if ui.button(format!("{}…", format.label())).clicked() {
+                        self.actions.push(Action::Export { source: p.clone(), format });
+                        ui.close();
+                    }
+                }
+            }
+        });
+    }
+
+    fn more_menu(&mut self, ui: &mut egui::Ui) {
+        let resp = icons::button(ui, Icon::More, "更多");
+        egui::Popup::menu(&resp).show(|ui| {
+            ui.set_min_width(170.0);
+            if let Some(root) = self.library.as_ref().map(|l| l.root.clone()) {
+                if ui.button("在檔案管理員中開啟書庫").clicked() {
+                    self.actions.push(Action::Reveal(root));
+                    ui.close();
+                }
+            }
+            if ui.button("開啟其他資料夾…").clicked() {
+                self.actions.push(Action::PickLibrary);
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("鍵盤快捷鍵").clicked() {
+                self.dialog = Some(Dialog::Shortcuts);
+                ui.close();
+            }
+            if ui.button("關於書齋").clicked() {
+                self.dialog = Some(Dialog::About);
+                ui.close();
+            }
+        });
+    }
+
+    fn status_bar(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        ui.horizontal_centered(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            // 左：目前檔案位置
+            if let Some(path) = self.current_path().map(Path::to_path_buf) {
+                let rel = self
+                    .library
+                    .as_ref()
+                    .and_then(|l| path.strip_prefix(&l.root).ok())
+                    .map(|r| r.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("  /  "))
+                    .unwrap_or_else(|| path.display().to_string());
+                ui.label(RichText::new(rel).small().color(pal.weak));
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                let mut save = false;
+                if let Some(doc) = self.doc.as_mut() {
+                    if doc.words_stale && doc.last_edit.elapsed() > Duration::from_millis(400) {
+                        doc.words = markdown::word_count(&doc.text);
+                        doc.words_stale = false;
+                    }
+                    let (text, color) = if doc.dirty { ("未儲存", pal.accent) } else { ("已儲存", pal.weak) };
+                    let resp =
+                        ui.add(egui::Label::new(RichText::new(text).small().color(color)).sense(egui::Sense::click()));
+                    save = resp.on_hover_text("Ctrl+S 儲存（停止輸入後也會自動儲存）").clicked();
+                    ui.label(RichText::new(format!("{} 字", doc.words)).small().color(pal.weak));
+                }
+                if save {
+                    self.save_current();
+                }
+
                 let mut clear = false;
                 match &self.status {
                     Some(Status::Info(msg, t)) => {
-                        ui.label(msg);
+                        ui.label(RichText::new(msg).small());
                         clear = t.elapsed() > Duration::from_secs(4);
                     }
                     Some(Status::Error(msg, t)) => {
-                        ui.label(RichText::new(msg.lines().next().unwrap_or("")).color(ui.visuals().error_fg_color))
-                            .on_hover_text(msg);
+                        ui.label(
+                            RichText::new(msg.lines().next().unwrap_or("")).small().color(ui.visuals().error_fg_color),
+                        )
+                        .on_hover_text(msg);
                         clear = t.elapsed() > Duration::from_secs(15);
                     }
                     Some(Status::Working(msg)) => {
-                        ui.spinner();
-                        ui.label(msg);
+                        ui.label(RichText::new(msg).small());
+                        ui.add(egui::Spinner::new().size(12.0));
                     }
                     Some(Status::Exported(p)) => {
-                        if ui.small_button("✕").clicked() {
+                        if ui.add(egui::Button::new(RichText::new("關閉").small()).small()).clicked() {
                             clear = true;
                         }
-                        if ui.small_button("開啟資料夾").clicked() {
+                        if ui.add(egui::Button::new(RichText::new("開啟資料夾").small()).small()).clicked() {
                             self.actions.push(Action::Reveal(p.parent().unwrap_or(p).to_path_buf()));
                         }
-                        if ui.small_button("開啟").clicked() {
-                            self.actions.push(Action::Reveal(p.clone()));
+                        let view = if shosai_core::is_pdf(p) && cfg!(feature = "pdf") { "檢視" } else { "開啟" };
+                        if ui.add(egui::Button::new(RichText::new(view).small()).small()).clicked() {
+                            if view == "檢視" {
+                                self.actions.push(Action::Open(p.clone()));
+                            } else {
+                                self.actions.push(Action::Reveal(p.clone()));
+                            }
+                            clear = true;
                         }
-                        ui.label(format!("已輸出 {}", p.file_name().unwrap_or_default().to_string_lossy()));
+                        ui.label(
+                            RichText::new(format!("已輸出 {}", p.file_name().unwrap_or_default().to_string_lossy()))
+                                .small(),
+                        );
                     }
                     None => {}
                 }
@@ -752,48 +905,64 @@ impl ShosaiApp {
         });
     }
 
-    fn sidebar(&mut self, ui: &mut egui::Ui) {
+    fn sidebar(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         let Some(lib) = &self.library else {
-            ui.add_space(8.0);
-            if ui.button("📂 開啟資料夾…").clicked() {
-                self.actions.push(Action::PickLibrary);
-            }
+            ui.add_space(12.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("尚未開啟書庫").color(pal.weak));
+                ui.add_space(6.0);
+                if ui.button("開啟資料夾…").clicked() {
+                    self.actions.push(Action::PickLibrary);
+                }
+            });
             return;
         };
         let root = lib.root.clone();
         let root_name =
             root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| root.display().to_string());
 
+        // 標題列：書庫名稱（點擊切換書庫）＋ 新增 / 重新整理 / 同步
         ui.horizontal(|ui| {
-            ui.menu_button("📂", |ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let name = egui::Button::new(RichText::new(&root_name).strong().size(15.0)).frame_when_inactive(false);
+            let resp = ui.add(name).on_hover_text(root.display().to_string());
+            egui::Popup::menu(&resp).show(|ui| {
+                ui.set_min_width(220.0);
                 if ui.button("開啟其他資料夾…").clicked() {
                     self.actions.push(Action::PickLibrary);
+                    ui.close();
                 }
                 let recent: Vec<PathBuf> =
                     self.settings.recent_libraries.iter().filter(|r| **r != root && r.is_dir()).cloned().collect();
                 if !recent.is_empty() {
-                    ui.separator();
-                    ui.label(RichText::new("最近使用").weak());
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("最近使用").weak().small());
                     for r in recent {
-                        if ui.button(r.display().to_string()).clicked() {
+                        let label = r.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        if ui.button(label).on_hover_text(r.display().to_string()).clicked() {
                             self.actions.push(Action::OpenLibrary(r));
+                            ui.close();
                         }
                     }
                 }
-            })
-            .response
-            .on_hover_text("書庫");
-            ui.label(RichText::new(&root_name).strong()).on_hover_text(root.display().to_string());
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.menu_button("＋", |ui| new_menu(ui, &root, &mut self.actions));
-                if ui.button("⟳").on_hover_text("重新整理").clicked() {
+                let plus = icons::button_sized(ui, Icon::Plus, "新增", 26.0);
+                egui::Popup::menu(&plus).show(|ui| {
+                    ui.set_min_width(150.0);
+                    tree::new_menu(ui, &root, &mut self.actions);
+                });
+                if icons::button_sized(ui, Icon::Refresh, "重新整理", 26.0).clicked() {
                     self.actions.push(Action::Refresh);
                 }
                 #[cfg(feature = "nextcloud")]
                 {
                     let busy = self.sync_job.is_some();
-                    let resp =
-                        ui.add_enabled(!busy, egui::Button::new("☁")).on_hover_text("與 Nextcloud 同步（右鍵：設定）");
+                    let resp = ui
+                        .add_enabled_ui(!busy, |ui| {
+                            icons::button_sized(ui, Icon::Cloud, "與 Nextcloud 同步（右鍵：設定）", 26.0)
+                        })
+                        .inner;
                     if resp.clicked() {
                         self.actions.push(Action::Sync);
                     }
@@ -806,32 +975,69 @@ impl ShosaiApp {
                 }
             });
         });
-        ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("🔍 搜尋檔名…").desired_width(f32::INFINITY));
-        ui.separator();
+        ui.add_space(6.0);
 
-        let current = self.doc.as_ref().map(|d| d.path.clone());
+        // 搜尋框
+        egui::Frame::new()
+            .fill(ui.visuals().extreme_bg_color)
+            .corner_radius(7)
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let h = ui.text_style_height(&TextStyle::Body);
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, h), egui::Sense::hover());
+                    let icon_rect = egui::Rect::from_center_size(r.center(), egui::vec2(14.0, 14.0));
+                    icons::paint(ui.painter(), icon_rect, Icon::Search, pal.weak);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.filter)
+                            .hint_text("搜尋檔案")
+                            .frame(egui::Frame::NONE)
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+            });
+        ui.add_space(8.0);
+
+        let current = self.current_path().map(Path::to_path_buf);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
             let lib = self.library.as_ref().unwrap();
-            let mut tree = TreeCtx {
+            let mut cx = TreeCtx {
                 current: current.as_deref(),
                 books: &self.books,
                 actions: &mut self.actions,
-                lib_root: &root,
+                expanded: &mut self.settings.expanded,
+                pal: *pal,
             };
             if !self.filter.trim().is_empty() {
                 let q = self.filter.trim().to_lowercase();
+                let mut any = false;
                 for e in lib.all_files() {
                     let rel = e.path.strip_prefix(&root).unwrap_or(&e.path).to_string_lossy().into_owned();
                     if rel.to_lowercase().contains(&q) {
-                        file_row(ui, &e.path, &rel, &mut tree);
+                        any = true;
+                        tree::file_labeled(ui, &e.path, &rel, e.kind == EntryKind::Pdf, 0, &mut cx);
                     }
                 }
+                if !any {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("沒有符合的檔案").color(pal.weak));
+                }
             } else if let Some(book) = self.books.get(&root) {
-                book_contents(ui, book, &mut tree);
+                let entry = Entry {
+                    path: root.clone(),
+                    name: root_name.clone(),
+                    kind: EntryKind::Book,
+                    children: lib.entries.clone(),
+                };
+                tree::book_contents(ui, book, &entry, 0, &mut cx);
             } else if lib.entries.is_empty() {
-                ui.label(RichText::new("這個資料夾還沒有 Markdown 檔。\n用上方的「＋」新增筆記或書本。").weak());
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("這個資料夾還沒有 Markdown 或 PDF 檔。\n用上方的 + 新增筆記或書本。").color(pal.weak),
+                );
             } else {
-                tree_ui(ui, &lib.entries, &mut tree);
+                tree::entries(ui, &lib.entries, 0, &mut cx);
             }
         });
     }
@@ -841,18 +1047,24 @@ impl ShosaiApp {
         let Some(doc) = self.doc.as_mut() else { return };
         egui::ScrollArea::vertical().id_salt(("editor", &doc.path)).auto_shrink([false, false]).show(ui, |ui| {
             let full = ui.available_width();
-            let width = if centered { full.min(860.0) } else { full };
+            let width = if centered { full.min(800.0) } else { full };
+            ui.add_space(if centered { 28.0 } else { 8.0 });
+            let pad: i8 = if centered { 28 } else { 22 };
             ui.horizontal(|ui| {
                 ui.add_space(((full - width) / 2.0).max(0.0));
-                let edit = egui::TextEdit::multiline(&mut doc.text)
-                    .font(FontId::monospace(size))
-                    .desired_width(width - 8.0)
-                    .desired_rows(30)
-                    .lock_focus(true)
-                    .frame(egui::Frame::NONE)
-                    .margin(egui::Margin::symmetric(12, 10))
-                    .hint_text("# 標題\n\n開始寫作……");
-                let response = ui.add(edit);
+                let response = egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(pad, 6))
+                    .show(ui, |ui| {
+                        let edit = egui::TextEdit::multiline(&mut doc.text)
+                            .font(FontId::monospace(size))
+                            .desired_width(width - 2.0 * pad as f32)
+                            .desired_rows(30)
+                            .lock_focus(true)
+                            .frame(egui::Frame::NONE)
+                            .hint_text("# 標題\n\n開始寫作……");
+                        ui.add(edit)
+                    })
+                    .inner;
                 if response.changed() {
                     doc.dirty = true;
                     doc.words_stale = true;
@@ -868,13 +1080,13 @@ impl ShosaiApp {
         let md_view = &mut self.md_view;
         let events = &mut self.view_events;
         egui::ScrollArea::vertical().id_salt(("preview", &doc.path)).auto_shrink([false, false]).show(ui, |ui| {
-            egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 10)).show(ui, |ui| {
+            egui::Frame::new().inner_margin(egui::Margin { left: 24, right: 24, top: 16, bottom: 32 }).show(ui, |ui| {
                 events.extend(md_view.show(ui, &doc.text, &base));
             });
         });
     }
 
-    fn reader(&mut self, ui: &mut egui::Ui) {
+    fn reader(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         let Some(doc) = self.doc.as_ref() else { return };
         let path = doc.path.clone();
         let seq = self.reading_sequence(&path);
@@ -904,39 +1116,37 @@ impl ShosaiApp {
             }
         }
 
-        let dark = ui.visuals().dark_mode;
-        let (desk, paper, ink) = if dark {
-            (Color32::from_rgb(24, 23, 21), Color32::from_rgb(36, 34, 31), Color32::from_rgb(221, 214, 200))
-        } else {
-            (Color32::from_rgb(232, 226, 214), Color32::from_rgb(251, 248, 241), Color32::from_rgb(43, 38, 32))
-        };
+        let (desk, paper, ink, weak) = (pal.desk, pal.paper, pal.ink, pal.weak);
         let size = self.settings.reader_size;
         let max_w = self.settings.reader_width;
         let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
         let md_view = &mut self.md_view;
         let events = &mut self.view_events;
         let actions = &mut self.actions;
+        let dark = ui.visuals().dark_mode;
 
         egui::Frame::new().fill(desk).show(ui, |ui| {
             egui::ScrollArea::vertical().id_salt(("reader", &path)).auto_shrink([false, false]).show(ui, |ui| {
                 let full = ui.available_width();
-                let page_w = full.min(max_w + 2.0 * 56.0).max(200.0);
-                ui.add_space(24.0);
+                let narrow = full < 640.0;
+                let pad: i8 = if narrow { 22 } else { 60 };
+                let page_w = full.min(max_w + 2.0 * pad as f32).max(200.0);
+                ui.add_space(if narrow { 0.0 } else { 28.0 });
                 ui.horizontal(|ui| {
                     ui.add_space(((full - page_w) / 2.0).max(0.0));
                     egui::Frame::new()
                         .fill(paper)
-                        .corner_radius(4.0)
+                        .corner_radius(if narrow { 0 } else { 6 })
                         .shadow(egui::Shadow {
-                            offset: [0, 4],
-                            blur: 18,
+                            offset: [0, 6],
+                            blur: 24,
                             spread: 0,
-                            color: Color32::from_black_alpha(40),
+                            color: Color32::from_black_alpha(if dark { 70 } else { 22 }),
                         })
-                        .inner_margin(egui::Margin::symmetric(if page_w < 520.0 { 20 } else { 56 }, 44))
+                        .inner_margin(egui::Margin::symmetric(pad, 48))
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
-                                ui.set_width(page_w - if page_w < 520.0 { 40.0 } else { 112.0 });
+                                ui.set_width(page_w - 2.0 * pad as f32);
                                 let style = ui.style_mut();
                                 style.visuals.override_text_color = Some(ink);
                                 style.text_styles.insert(TextStyle::Body, FontId::proportional(size));
@@ -948,121 +1158,142 @@ impl ShosaiApp {
 
                                 if let Some(t) = &book_title {
                                     ui.vertical_centered(|ui| {
-                                        ui.label(RichText::new(t).size(size * 0.75).weak());
+                                        ui.label(RichText::new(t).size(size * 0.72).color(weak));
                                     });
-                                    ui.add_space(size);
+                                    ui.add_space(size * 1.5);
                                 }
                                 events.extend(md_view.show(ui, &doc.text, &base));
 
-                                ui.add_space(size * 2.0);
-                                ui.separator();
+                                // 章末：上一章 / 下一章
+                                ui.add_space(size * 3.0);
                                 ui.horizontal(|ui| {
                                     if let Some((p, t)) = &prev {
-                                        if ui.button(format!("‹ {t}")).on_hover_text("← 上一章").clicked() {
+                                        let b = egui::Button::new(RichText::new(format!("‹  {t}")).color(weak));
+                                        if ui.add(b).on_hover_text("上一章（←）").clicked() {
                                             actions.push(Action::Open(p.clone()));
                                         }
                                     }
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         if let Some((p, t)) = &next {
-                                            if ui.button(format!("{t} ›")).on_hover_text("下一章 →").clicked() {
+                                            let b = egui::Button::new(RichText::new(format!("{t}  ›")).color(weak));
+                                            if ui.add(b).on_hover_text("下一章（→）").clicked() {
                                                 actions.push(Action::Open(p.clone()));
                                             }
                                         }
-                                        if let Some(i) = pos {
-                                            if seq.len() > 1 {
-                                                ui.centered_and_justified(|ui| {
-                                                    ui.label(
-                                                        RichText::new(format!("{} / {}", i + 1, seq.len())).weak(),
-                                                    );
-                                                });
-                                            }
+                                        if let (Some(i), true) = (pos, seq.len() > 1) {
+                                            ui.centered_and_justified(|ui| {
+                                                ui.label(
+                                                    RichText::new(format!("{} / {}", i + 1, seq.len()))
+                                                        .size(size * 0.75)
+                                                        .color(weak),
+                                                );
+                                            });
                                         }
                                     });
                                 });
                             })
                         });
                 });
-                ui.add_space(32.0);
+                ui.add_space(36.0);
             });
         });
     }
 
-    fn welcome(&mut self, ui: &mut egui::Ui) {
+    fn welcome(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         ui.vertical_centered(|ui| {
-            ui.add_space(ui.available_height() * 0.22);
-            ui.label(RichText::new("書齋").size(44.0).strong());
-            ui.label(RichText::new("輕量的 Markdown 寫作與閱讀器").size(16.0).weak());
-            ui.add_space(28.0);
+            ui.add_space((ui.available_height() * 0.24).max(24.0));
+            ui.label(RichText::new("書齋").size(46.0).color(pal.ink));
+            ui.add_space(4.0);
+            ui.label(RichText::new("輕量的 Markdown 寫作與閱讀器").size(15.0).color(pal.weak));
+            ui.add_space(32.0);
             if self.library.is_none() {
-                if ui.button(RichText::new("📂 開啟資料夾…").size(16.0)).clicked() {
+                let open = egui::Button::new(RichText::new("開啟資料夾…").size(15.0).color(Color32::WHITE))
+                    .fill(pal.accent)
+                    .corner_radius(8)
+                    .min_size(egui::vec2(160.0, 36.0));
+                if ui.add(open).clicked() {
                     self.actions.push(Action::PickLibrary);
                 }
-                ui.add_space(6.0);
-                ui.label(RichText::new("也可以把資料夾或 .md 檔拖曳進視窗").weak());
+                ui.add_space(10.0);
+                ui.label(RichText::new("也可以把資料夾、Markdown 或 PDF 檔拖曳進視窗").small().color(pal.weak));
                 let recent: Vec<PathBuf> =
                     self.settings.recent_libraries.iter().filter(|r| r.is_dir()).cloned().collect();
                 if !recent.is_empty() {
-                    ui.add_space(18.0);
-                    ui.label(RichText::new("最近使用").weak());
+                    ui.add_space(28.0);
+                    ui.label(RichText::new("最近使用").small().color(pal.weak));
+                    ui.add_space(4.0);
                     for r in recent {
-                        if ui.link(r.display().to_string()).clicked() {
+                        let name = r.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        if ui.button(name).on_hover_text(r.display().to_string()).clicked() {
                             self.actions.push(Action::OpenLibrary(r));
                         }
                     }
                 }
             } else {
-                ui.label(RichText::new("從左側選一個檔案開始，或用「＋」新增筆記、書本").weak());
-                ui.add_space(12.0);
-                ui.label(
-                    RichText::new("Ctrl+N 新增筆記　Ctrl+S 儲存　Ctrl+1/2/3 切換模式　Ctrl+B 側欄").weak().small(),
-                );
+                ui.label(RichText::new("從左側選一個檔案開始，或按 + 新增筆記、建立書本").color(pal.weak));
+                ui.add_space(16.0);
+                for (k, v) in [("Ctrl+N", "新增筆記"), ("Ctrl+1 / 2 / 3", "編輯 / 分割 / 閱讀"), ("Ctrl+B", "側欄")]
+                {
+                    ui.label(RichText::new(format!("{k}　{v}")).small().color(pal.weak));
+                }
             }
         });
     }
 
-    fn dialogs(&mut self, ctx: &egui::Context) {
+    fn dialogs(&mut self, ctx: &egui::Context, pal: &Palette) {
         let Some(mut dialog) = self.dialog.take() else { return };
         let mut keep = true;
         let mut confirm = false;
 
         let modal = egui::Modal::new(egui::Id::unique("shosai-dialog")).show(ctx, |ui| {
-            ui.set_min_width(340.0);
+            ui.set_min_width(360.0);
+            ui.spacing_mut().item_spacing.y = 8.0;
             let enter = ui.input(|i| i.key_pressed(Key::Enter));
+            let title = |ui: &mut egui::Ui, t: &str| {
+                ui.label(RichText::new(t).size(17.0).strong());
+                ui.add_space(4.0);
+            };
             match &mut dialog {
                 Dialog::NewNote { name, .. } => {
-                    ui.heading("新增筆記");
+                    title(ui, "新增筆記");
                     focused_input(ui, name, "檔名");
                     confirm |= enter;
                 }
                 Dialog::NewFolder { name, .. } => {
-                    ui.heading("新增資料夾");
+                    title(ui, "新增資料夾");
                     focused_input(ui, name, "資料夾名稱");
                     confirm |= enter;
                 }
-                Dialog::NewBook { title, author, .. } => {
-                    ui.heading("建立新書");
-                    ui.label("會建立一個資料夾，裡面每個 Markdown 檔就是一章。");
-                    focused_input(ui, title, "書名");
+                Dialog::NewBook { title: book_title, author, .. } => {
+                    title(ui, "建立新書");
+                    ui.label(RichText::new("會建立一個資料夾，裡面每個 Markdown 檔就是一章。").color(pal.weak));
+                    focused_input(ui, book_title, "書名");
                     ui.add(egui::TextEdit::singleline(author).hint_text("作者（可留空）").desired_width(f32::INFINITY));
                 }
-                Dialog::NewChapter { title, .. } => {
-                    ui.heading("新增章節");
-                    focused_input(ui, title, "章節標題");
+                Dialog::NewChapter { title: t, .. } => {
+                    title(ui, "新增章節");
+                    focused_input(ui, t, "章節標題");
                     confirm |= enter;
                 }
                 Dialog::Rename { name, .. } => {
-                    ui.heading("重新命名");
+                    title(ui, "重新命名");
                     focused_input(ui, name, "新名稱");
                     confirm |= enter;
                 }
                 Dialog::Trash { path } => {
-                    ui.heading("移到回收桶");
+                    title(ui, "移到回收桶");
                     ui.label(format!("確定要移除「{}」？", path.file_name().unwrap_or_default().to_string_lossy()));
-                    ui.label(RichText::new(format!("檔案會移到書庫的 {} 資料夾，可以手動救回。", library::TRASH_DIR)).weak());
+                    ui.label(
+                        RichText::new(format!("檔案會移到書庫的 {} 資料夾，可以手動救回。", library::TRASH_DIR))
+                            .color(pal.weak),
+                    );
                 }
-                Dialog::BookSettings { meta, .. } => book_settings_ui(ui, meta),
+                Dialog::BookSettings { meta, .. } => {
+                    title(ui, "書本設定");
+                    book_settings_ui(ui, meta);
+                }
                 Dialog::Nextcloud { server, user, password, remote_dir, insecure } => {
-                    ui.heading("Nextcloud 同步設定");
+                    title(ui, "Nextcloud 同步設定");
                     egui::Grid::new("nc").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                         ui.label("伺服器");
                         ui.add(egui::TextEdit::singleline(server).hint_text("https://cloud.example.com"));
@@ -1080,37 +1311,58 @@ impl ShosaiApp {
                     ui.checkbox(insecure, "略過 TLS 憑證檢查（自簽憑證的 homelab）");
                     ui.label(
                         RichText::new("密碼會以明文存在書庫的 .shosai/nextcloud.toml（此資料夾不會被同步）。\n請在 Nextcloud「設定 → 安全性」建立專用的應用程式密碼。")
-                            .weak()
-                            .small(),
+                            .small()
+                            .color(pal.weak),
                     );
                 }
                 Dialog::Report(report) => {
-                    ui.heading("同步完成");
+                    title(ui, "同步完成");
                     egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                         ui.label(RichText::new(report.as_str()).monospace());
                     });
                 }
+                Dialog::Shortcuts => {
+                    title(ui, "鍵盤快捷鍵");
+                    egui::Grid::new("keys").num_columns(2).spacing([24.0, 6.0]).show(ui, |ui| {
+                        for (k, v) in [
+                            ("Ctrl+S", "儲存（也會自動儲存）"),
+                            ("Ctrl+N", "新增筆記"),
+                            ("Ctrl+1 / 2 / 3", "編輯 / 分割 / 閱讀"),
+                            ("Ctrl+B", "顯示 / 隱藏側欄"),
+                            ("Ctrl+= / Ctrl+-", "放大 / 縮小（PDF 為縮放）"),
+                            ("← / →", "閱讀模式翻章；PDF 翻頁"),
+                        ] {
+                            ui.label(RichText::new(k).monospace());
+                            ui.label(v);
+                            ui.end_row();
+                        }
+                    });
+                }
                 Dialog::About => {
-                    ui.heading("書齋 Shosai");
+                    title(ui, "書齋 Shosai");
                     ui.label(format!("版本 {}", env!("CARGO_PKG_VERSION")));
                     ui.label("輕量的 Markdown 寫作與閱讀器，可將資料夾整理成書並輸出 PDF。");
-                    ui.add_space(6.0);
-                    ui.label(RichText::new("PDF 排版引擎：Typst　介面：egui").weak());
+                    ui.label(RichText::new("排版：Typst　數學式：MiTeX　PDF 檢視：hayro　介面：egui").small().color(pal.weak));
                 }
             }
-            ui.add_space(8.0);
-            ui.separator();
-            ui.horizontal(|ui| {
-                let label = match &dialog {
-                    Dialog::Trash { .. } => "移除",
-                    Dialog::About | Dialog::Report(_) => "關閉",
-                    Dialog::BookSettings { .. } => "儲存",
-                    _ => "確定",
+            ui.add_space(10.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (label, danger) = match &dialog {
+                    Dialog::Trash { .. } => ("移除", true),
+                    Dialog::About | Dialog::Report(_) | Dialog::Shortcuts => ("關閉", false),
+                    Dialog::BookSettings { .. } => ("儲存", false),
+                    _ => ("確定", false),
                 };
-                if ui.button(label).clicked() {
+                let fill = if danger { ui.visuals().error_fg_color } else { pal.accent };
+                let primary = egui::Button::new(RichText::new(label).color(Color32::WHITE))
+                    .fill(fill)
+                    .min_size(egui::vec2(72.0, 28.0));
+                if ui.add(primary).clicked() {
                     confirm = true;
                 }
-                if !matches!(dialog, Dialog::About | Dialog::Report(_)) && ui.button("取消").clicked() {
+                if !matches!(dialog, Dialog::About | Dialog::Report(_) | Dialog::Shortcuts)
+                    && ui.add(egui::Button::new("取消").min_size(egui::vec2(64.0, 28.0))).clicked()
+                {
                     keep = false;
                 }
             });
@@ -1139,8 +1391,9 @@ impl ShosaiApp {
                 self.settings.view = ViewMode::Edit;
             }
             Dialog::NewFolder { dir, name } => {
-                library::create_dir(&dir, if name.trim().is_empty() { "新資料夾" } else { &name })
+                let path = library::create_dir(&dir, if name.trim().is_empty() { "新資料夾" } else { &name })
                     .map_err(|e| e.to_string())?;
+                self.settings.expanded.insert(path);
                 self.refresh();
             }
             Dialog::NewBook { dir, title, author } => {
@@ -1149,6 +1402,7 @@ impl ShosaiApp {
                 let target = library::create_dir(&dir, &title).map_err(|e| e.to_string())?;
                 let book = Book::create(&target, &title, author.trim()).map_err(|e| e.to_string())?;
                 let first = book.chapters.first().map(|c| c.path.clone());
+                self.settings.expanded.insert(target);
                 self.refresh();
                 if let Some(first) = first {
                     self.open_file(&first);
@@ -1176,6 +1430,12 @@ impl ShosaiApp {
                         self.settings.last_file = Some(doc.path.clone());
                     }
                 }
+                if self.pdf.as_ref().is_some_and(|p| p.path.starts_with(&path)) {
+                    self.pdf = None;
+                }
+                if self.settings.expanded.remove(&path) {
+                    self.settings.expanded.insert(new.clone());
+                }
                 if lib_root.as_deref() == Some(path.as_path()) {
                     self.open_library(&new);
                 } else {
@@ -1186,6 +1446,9 @@ impl ShosaiApp {
                 let root = lib_root.ok_or("沒有開啟書庫")?;
                 if self.doc.as_ref().is_some_and(|d| d.path.starts_with(&path)) {
                     self.doc = None;
+                }
+                if self.pdf.as_ref().is_some_and(|p| p.path.starts_with(&path)) {
+                    self.pdf = None;
                 }
                 library::trash(&root, &path).map_err(|e| e.to_string())?;
                 self.refresh();
@@ -1209,11 +1472,11 @@ impl ShosaiApp {
                     insecure,
                 };
                 cfg.save(&root).map_err(|e| e.to_string())?;
-                self.info("同步設定已儲存，按 ☁ 開始同步");
+                self.info("同步設定已儲存，按側欄的雲朵圖示開始同步");
             }
             #[cfg(not(feature = "nextcloud"))]
             Dialog::Nextcloud { .. } => {}
-            Dialog::Report(_) | Dialog::About => {}
+            Dialog::Report(_) | Dialog::About | Dialog::Shortcuts => {}
         }
         Ok(())
     }
@@ -1224,51 +1487,65 @@ impl eframe::App for ShosaiApp {
         let ctx = ui.ctx().clone();
         self.apply_theme(&ctx);
         self.shortcuts(&ctx);
+        self.poll_export();
+        let pal = theme::palette(ui.visuals().dark_mode);
 
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            ui.add_space(3.0);
-            self.toolbar(ui);
-            ui.add_space(1.0);
-        });
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        egui::Panel::top("toolbar")
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(pal.chrome).inner_margin(egui::Margin::symmetric(8, 6)))
+            .show(ui, |ui| self.toolbar(ui, &pal));
+        egui::Panel::bottom("status")
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(pal.chrome).inner_margin(egui::Margin::symmetric(12, 3)))
+            .show(ui, |ui| self.status_bar(ui, &pal));
 
         let mut sidebar_open = self.settings.sidebar;
-        egui::Panel::left("sidebar").resizable(true).default_size(250.0).size_range(160.0..=480.0).show_collapsible(
-            ui,
-            &mut sidebar_open,
-            |ui| {
-                ui.add_space(4.0);
-                self.sidebar(ui);
-            },
-        );
+        egui::Panel::left("sidebar")
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(pal.chrome).inner_margin(egui::Margin {
+                left: 10,
+                right: 6,
+                top: 4,
+                bottom: 6,
+            }))
+            .resizable(true)
+            .default_size(260.0)
+            .size_range(180.0..=480.0)
+            .show_collapsible(ui, &mut sidebar_open, |ui| self.sidebar(ui, &pal));
         self.settings.sidebar = sidebar_open;
 
-        let mode = self.settings.view;
-        let paper = egui::Frame::new().fill(ui.visuals().panel_fill);
-        if self.doc.is_none() {
-            egui::CentralPanel::default_margins().show(ui, |ui| self.welcome(ui));
+        let surface = egui::Frame::new().fill(pal.surface);
+        if self.pdf.is_some() {
+            egui::CentralPanel::no_frame().show(ui, |ui| {
+                if let Some(pdf) = self.pdf.as_mut() {
+                    pdf.show(ui, pal.desk);
+                }
+            });
+        } else if self.doc.is_none() {
+            egui::CentralPanel::no_frame().frame(surface).show(ui, |ui| self.welcome(ui, &pal));
         } else {
-            match mode {
+            match self.settings.view {
                 ViewMode::Edit => {
-                    egui::CentralPanel::no_frame().frame(paper).show(ui, |ui| self.editor(ui, true));
+                    egui::CentralPanel::no_frame().frame(surface).show(ui, |ui| self.editor(ui, true));
                 }
                 ViewMode::Split => {
                     let half = ui.available_width() / 2.0;
                     egui::Panel::right("preview")
-                        .frame(paper)
+                        .show_separator_line(false)
+                        .frame(egui::Frame::new().fill(pal.paper))
                         .resizable(true)
                         .default_size(half)
-                        .size_range(200.0..=f32::INFINITY)
+                        .size_range(220.0..=f32::INFINITY)
                         .show(ui, |ui| self.preview(ui));
-                    egui::CentralPanel::no_frame().frame(paper).show(ui, |ui| self.editor(ui, false));
+                    egui::CentralPanel::no_frame().frame(surface).show(ui, |ui| self.editor(ui, false));
                 }
                 ViewMode::Read => {
-                    egui::CentralPanel::no_frame().show(ui, |ui| self.reader(ui));
+                    egui::CentralPanel::no_frame().show(ui, |ui| self.reader(ui, &pal));
                 }
             }
         }
 
-        self.dialogs(&ctx);
+        self.dialogs(&ctx, &pal);
         self.handle_view_events(&ctx);
         self.process_actions(&ctx);
         self.poll_sync();
@@ -1299,13 +1576,14 @@ impl eframe::App for ShosaiApp {
         }
 
         // 視窗標題
-        let title = match &self.doc {
-            Some(d) => format!(
+        let title = match (&self.doc, self.current_path()) {
+            (Some(d), _) => format!(
                 "{}{} — 書齋",
                 if d.dirty { "● " } else { "" },
                 d.path.file_name().unwrap_or_default().to_string_lossy()
             ),
-            None => "書齋".into(),
+            (None, Some(p)) => format!("{} — 書齋", p.file_name().unwrap_or_default().to_string_lossy()),
+            _ => "書齋".into(),
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
     }
@@ -1320,156 +1598,6 @@ impl eframe::App for ShosaiApp {
 }
 
 // ---------------------------------------------------------------------------
-// 側欄樹狀清單
-
-struct TreeCtx<'a> {
-    current: Option<&'a Path>,
-    books: &'a HashMap<PathBuf, Book>,
-    actions: &'a mut Vec<Action>,
-    lib_root: &'a Path,
-}
-
-fn tree_ui(ui: &mut egui::Ui, entries: &[Entry], ctx: &mut TreeCtx) {
-    for e in entries {
-        match e.kind {
-            EntryKind::Markdown => {
-                let label = e.name.trim_end_matches(".md").to_string();
-                file_row(ui, &e.path, &label, ctx);
-            }
-            EntryKind::Dir => {
-                let open = ctx.current.is_some_and(|c| c.starts_with(&e.path));
-                let resp = egui::CollapsingHeader::new(format!("📁 {}", e.name))
-                    .id_salt(&e.path)
-                    .default_open(open)
-                    .show(ui, |ui| {
-                        if e.children.is_empty() {
-                            ui.label(RichText::new("（空）").weak());
-                        }
-                        tree_ui(ui, &e.children, ctx);
-                    });
-                resp.header_response.context_menu(|ui| {
-                    new_menu(ui, &e.path, ctx.actions);
-                    ui.separator();
-                    common_menu(ui, &e.path, ctx.actions);
-                });
-            }
-            EntryKind::Book => {
-                let Some(book) = ctx.books.get(&e.path) else { continue };
-                let open = ctx.current.is_some_and(|c| c.starts_with(&e.path));
-                let resp = egui::CollapsingHeader::new(RichText::new(format!("📖 {}", book.meta.title)).strong())
-                    .id_salt(&e.path)
-                    .default_open(open)
-                    .show(ui, |ui| book_contents(ui, book, ctx));
-                resp.header_response.context_menu(|ui| {
-                    book_menu(ui, book, ctx.actions);
-                    ui.separator();
-                    common_menu(ui, &e.path, ctx.actions);
-                });
-            }
-        }
-    }
-}
-
-fn book_contents(ui: &mut egui::Ui, book: &Book, ctx: &mut TreeCtx) {
-    let n = book.chapters.len();
-    for (i, ch) in book.chapters.iter().enumerate() {
-        let selected = ctx.current == Some(ch.path.as_path());
-        let resp = ui.selectable_label(selected, format!("{}. {}", i + 1, ch.title)).on_hover_text(&ch.rel);
-        if resp.clicked() && !selected {
-            ctx.actions.push(Action::Open(ch.path.clone()));
-        }
-        resp.context_menu(|ui| {
-            if ui.add_enabled(i > 0, egui::Button::new("⬆ 上移")).clicked() {
-                ctx.actions.push(Action::MoveChapter { book: book.root.clone(), index: i, delta: -1 });
-                ui.close();
-            }
-            if ui.add_enabled(i + 1 < n, egui::Button::new("⬇ 下移")).clicked() {
-                ctx.actions.push(Action::MoveChapter { book: book.root.clone(), index: i, delta: 1 });
-                ui.close();
-            }
-            ui.separator();
-            common_menu(ui, &ch.path, ctx.actions);
-        });
-    }
-    if book.root == ctx.lib_root {
-        ui.separator();
-        book_menu(ui, book, ctx.actions);
-    } else if ui.small_button("＋ 新增章節").clicked() {
-        ctx.actions.push(Action::Dialog(Dialog::NewChapter { book: book.root.clone(), title: String::new() }));
-    }
-}
-
-fn file_row(ui: &mut egui::Ui, path: &Path, label: &str, ctx: &mut TreeCtx) {
-    let selected = ctx.current == Some(path);
-    let resp = ui.selectable_label(selected, format!("📄 {label}"));
-    if resp.clicked() && !selected {
-        ctx.actions.push(Action::Open(path.to_path_buf()));
-    }
-    resp.context_menu(|ui| {
-        if ui.button("輸出 PDF…").clicked() {
-            ctx.actions.push(Action::Export { source: path.to_path_buf(), format: Format::Pdf });
-            ui.close();
-        }
-        ui.separator();
-        common_menu(ui, path, ctx.actions);
-    });
-}
-
-fn new_menu(ui: &mut egui::Ui, dir: &Path, actions: &mut Vec<Action>) {
-    if ui.button("📄 新增筆記").clicked() {
-        actions.push(Action::Dialog(Dialog::NewNote { dir: dir.to_path_buf(), name: String::new() }));
-        ui.close();
-    }
-    if ui.button("📁 新增資料夾").clicked() {
-        actions.push(Action::Dialog(Dialog::NewFolder { dir: dir.to_path_buf(), name: String::new() }));
-        ui.close();
-    }
-    if ui.button("📖 建立新書").clicked() {
-        actions.push(Action::Dialog(Dialog::NewBook {
-            dir: dir.to_path_buf(),
-            title: String::new(),
-            author: String::new(),
-        }));
-        ui.close();
-    }
-}
-
-fn book_menu(ui: &mut egui::Ui, book: &Book, actions: &mut Vec<Action>) {
-    if ui.button("＋ 新增章節").clicked() {
-        actions.push(Action::Dialog(Dialog::NewChapter { book: book.root.clone(), title: String::new() }));
-        ui.close();
-    }
-    if ui.button("⚙ 書本設定").clicked() {
-        actions
-            .push(Action::Dialog(Dialog::BookSettings { root: book.root.clone(), meta: Box::new(book.meta.clone()) }));
-        ui.close();
-    }
-    if ui.button("📤 輸出 PDF…").clicked() {
-        actions.push(Action::Export { source: book.root.clone(), format: Format::Pdf });
-        ui.close();
-    }
-    if ui.button("📤 輸出 HTML…").clicked() {
-        actions.push(Action::Export { source: book.root.clone(), format: Format::Html });
-        ui.close();
-    }
-}
-
-fn common_menu(ui: &mut egui::Ui, path: &Path, actions: &mut Vec<Action>) {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    if ui.button("✏ 重新命名").clicked() {
-        actions.push(Action::Dialog(Dialog::Rename { path: path.to_path_buf(), name }));
-        ui.close();
-    }
-    if ui.button("📂 在檔案管理員中顯示").clicked() {
-        let target = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
-        actions.push(Action::Reveal(target.to_path_buf()));
-        ui.close();
-    }
-    if ui.button("🗑 移到回收桶").clicked() {
-        actions.push(Action::Dialog(Dialog::Trash { path: path.to_path_buf() }));
-        ui.close();
-    }
-}
 
 #[cfg(feature = "nextcloud")]
 fn nextcloud_dialog(root: &Path) -> Dialog {
@@ -1499,7 +1627,6 @@ fn focused_input(ui: &mut egui::Ui, text: &mut String, hint: &str) {
 }
 
 fn book_settings_ui(ui: &mut egui::Ui, meta: &mut BookMeta) {
-    ui.heading("書本設定");
     egui::Grid::new("book-settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
         ui.label("書名");
         ui.text_edit_singleline(&mut meta.title);
@@ -1538,8 +1665,6 @@ fn book_settings_ui(ui: &mut egui::Ui, meta: &mut BookMeta) {
     ui.checkbox(&mut l.cover, "產生封面");
     ui.checkbox(&mut l.toc, "產生目錄");
 }
-
-// ---------------------------------------------------------------------------
 
 fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()

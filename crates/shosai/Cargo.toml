@@ -11,11 +11,13 @@ egui_extras = { version = "0.37", default-features = false, features = ["image",
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 serde = { version = "1", features = ["derive"] }
 rfd = "0.15"
+# PDF 檢視（已是 Typst 的相依套件，不會額外增加體積）
+hayro = { version = "0.7", optional = true }
 
 [features]
 default = ["pdf"]
 # 內嵌 Typst PDF 引擎（關閉可縮小執行檔，改用系統的 typst 指令）
-pdf = ["shosai-core/pdf"]
+pdf = ["shosai-core/pdf", "dep:hayro"]
 # 內嵌 Typst 字型（+約 10MB，適合沒有字型的伺服器 / 容器）
 bundled-fonts = ["pdf", "shosai-core/bundled-fonts"]
 # Nextcloud / WebDAV 同步（實驗性）

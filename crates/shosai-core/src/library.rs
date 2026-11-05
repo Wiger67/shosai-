@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::book::is_book;
-use crate::{is_markdown, Result};
+use crate::{is_markdown, is_pdf, Result};
 
 /// 掃描時忽略的資料夾。
 pub const IGNORED_DIRS: &[&str] = &["target", "node_modules", TRASH_DIR];
@@ -17,6 +17,13 @@ pub enum EntryKind {
     Dir,
     Book,
     Markdown,
+    Pdf,
+}
+
+impl EntryKind {
+    pub fn is_file(&self) -> bool {
+        matches!(self, EntryKind::Markdown | EntryKind::Pdf)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -45,11 +52,11 @@ impl Library {
         Ok(())
     }
 
-    /// 所有 Markdown 檔（扁平），用於快速搜尋。
+    /// 所有檔案（Markdown 與 PDF，扁平），用於快速搜尋。
     pub fn all_files(&self) -> Vec<&Entry> {
         fn walk<'a>(entries: &'a [Entry], out: &mut Vec<&'a Entry>) {
             for e in entries {
-                if e.kind == EntryKind::Markdown {
+                if e.kind.is_file() {
                     out.push(e);
                 }
                 walk(&e.children, out);
@@ -82,11 +89,13 @@ fn scan(dir: &Path, depth: usize) -> Result<Vec<Entry>> {
             out.push(Entry { path, name, kind, children });
         } else if is_markdown(&path) {
             out.push(Entry { path, name, kind: EntryKind::Markdown, children: Vec::new() });
+        } else if is_pdf(&path) {
+            out.push(Entry { path, name, kind: EntryKind::Pdf, children: Vec::new() });
         }
     }
     out.sort_by(|a, b| {
-        let a_file = a.kind == EntryKind::Markdown;
-        let b_file = b.kind == EntryKind::Markdown;
+        let a_file = a.kind.is_file();
+        let b_file = b.kind.is_file();
         a_file.cmp(&b_file).then_with(|| natural_cmp(&a.name, &b.name))
     });
     Ok(out)
@@ -263,8 +272,11 @@ mod tests {
         assert!(renamed.ends_with("01-開端.md"));
         let book = crate::Book::open(&dir).unwrap();
         assert_eq!(book.meta.chapters, vec!["01-開端.md".to_string()]);
+        fs::write(dir.join("書.pdf"), b"%PDF-1.4").unwrap();
         let lib = Library::open(&dir).unwrap();
-        assert_eq!(lib.all_files().len(), 1);
+        assert_eq!(lib.all_files().len(), 2);
+        assert!(lib.all_files().iter().any(|e| e.kind == EntryKind::Pdf));
+        fs::remove_file(dir.join("書.pdf")).unwrap();
         trash(&dir, &renamed).unwrap();
         let lib = Library::open(&dir).unwrap();
         assert_eq!(lib.all_files().len(), 0);
