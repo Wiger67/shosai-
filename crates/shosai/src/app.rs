@@ -226,6 +226,8 @@ pub struct ShosaiApp {
     applied_scale: f32,
     show_settings: bool,
     settings_tab: SettingsTab,
+    /// 拖動介面縮放拉條時的暫定值（放開才套用，避免縮放改變拉條位置造成失控）
+    scale_draft: Option<f32>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -288,6 +290,7 @@ impl ShosaiApp {
             applied_scale: 0.0,
             show_settings: false,
             settings_tab: SettingsTab::Appearance,
+            scale_draft: None,
         };
 
         // 決定開啟的書庫與檔案：命令列參數 > 上次狀態
@@ -1382,12 +1385,43 @@ impl ShosaiApp {
                     ui.selectable_value(&mut st.dark, Some(true), "深色");
                 });
                 heading(ui, "介面縮放");
-                ui.add(
-                    egui::Slider::new(&mut st.ui_scale, 0.8..=1.5)
-                        .step_by(0.05)
-                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
-                );
-                hint(ui, "放大整個介面（含側欄、選單）。高解析度螢幕可設為 110%–125%。");
+                let mut draft = self.scale_draft.unwrap_or(st.ui_scale);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().slider_width = 220.0;
+                    if icons::button_sized(ui, Icon::Minus, "縮小 5%", 26.0).clicked() {
+                        st.ui_scale = ((st.ui_scale - 0.05) * 20.0).round() / 20.0;
+                        st.ui_scale = st.ui_scale.max(0.8);
+                        draft = st.ui_scale;
+                    }
+                    let resp = ui.add(
+                        egui::Slider::new(&mut draft, 0.8..=1.5)
+                            .step_by(0.05)
+                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                    );
+                    if icons::button_sized(ui, Icon::Plus, "放大 5%", 26.0).clicked() {
+                        st.ui_scale = ((st.ui_scale + 0.05) * 20.0).round() / 20.0;
+                        st.ui_scale = st.ui_scale.min(1.5);
+                        draft = st.ui_scale;
+                    }
+                    if resp.dragged() {
+                        // 拖動中只更新數字，放開滑鼠才套用
+                        self.scale_draft = Some(draft);
+                    } else {
+                        if resp.changed() || resp.drag_stopped() {
+                            st.ui_scale = draft;
+                        }
+                        self.scale_draft = None;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    for (v, label) in [(0.9, "90%"), (1.0, "100%"), (1.1, "110%"), (1.25, "125%"), (1.5, "150%")] {
+                        let selected = (st.ui_scale - v).abs() < 0.001 && self.scale_draft.is_none();
+                        if ui.add(egui::Button::selectable(selected, label)).clicked() {
+                            st.ui_scale = v;
+                        }
+                    }
+                });
+                hint(ui, "放大整個介面（含側欄、選單）。拖動拉條時放開滑鼠才會套用；高解析度螢幕可設為 110%–125%。");
             }
             SettingsTab::Editor => {
                 heading(ui, "字級");
