@@ -239,6 +239,9 @@ cargo test --workspace --all-features   # 單元測試＋把範例書實際輸�
 
 ## 輕量化的取捨
 
+- 閒置時不重畫：只有在輸入、捲動、檔案變動或背景工作完成時才重畫畫面，閒置 CPU／GPU 使用率為 0%
+  （可用 `SHOSAI_FRAME_STATS=1 shosai` 檢查每秒重畫次數）
+
 - GUI 使用 egui（立即模式、OpenGL），不帶瀏覽器核心；中文字型由系統「需要時才載入」，不拖慢啟動
 - PDF 引擎只在輸出時才初始化；系統字型只掃描一次並快取
 - 依賴套件以體積優先（`opt-level = "s"`）編譯；完整版約 36 MB，其中約 21 MB 是 Typst 排版引擎

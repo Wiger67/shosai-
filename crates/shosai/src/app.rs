@@ -228,6 +228,10 @@ pub struct ShosaiApp {
     settings_tab: SettingsTab,
     /// 拖動介面縮放拉條時的暫定值（放開才套用，避免縮放改變拉條位置造成失控）
     scale_draft: Option<f32>,
+    /// 目前視窗標題（避免每幀重送）
+    window_title: String,
+    /// SHOSAI_FRAME_STATS：每秒印出重畫次數（檢查閒置時是否真的不重畫）
+    frame_stats: Option<(Instant, u32)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -291,6 +295,8 @@ impl ShosaiApp {
             show_settings: false,
             settings_tab: SettingsTab::Appearance,
             scale_draft: None,
+            window_title: String::new(),
+            frame_stats: std::env::var_os("SHOSAI_FRAME_STATS").map(|_| (Instant::now(), 0)),
         };
 
         // 決定開啟的書庫與檔案：命令列參數 > 上次狀態
@@ -1870,6 +1876,15 @@ impl eframe::App for ShosaiApp {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
 
+        if let Some((since, frames)) = self.frame_stats.as_mut() {
+            *frames += 1;
+            if since.elapsed() >= Duration::from_secs(1) {
+                eprintln!("frames/s: {frames}");
+                *since = Instant::now();
+                *frames = 0;
+            }
+        }
+
         // 量測啟動速度：SHOSAI_STARTUP_TRACE=1 shosai
         if self.first_frame {
             self.first_frame = false;
@@ -1891,7 +1906,12 @@ impl eframe::App for ShosaiApp {
             (None, Some(p)) => format!("{} — 書齋", p.file_name().unwrap_or_default().to_string_lossy()),
             _ => "書齋".into(),
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        // 只有標題真的改變才送出：send_viewport_cmd 會順便要求重畫，
+        // 每幀都送會變成「畫 → 要求重畫 → 再畫」的無限迴圈，閒置時也持續吃 CPU / GPU。
+        if self.window_title != title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
