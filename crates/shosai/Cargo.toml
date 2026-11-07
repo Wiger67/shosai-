@@ -13,6 +13,8 @@ serde = { version = "1", features = ["derive"] }
 rfd = "0.15"
 # PDF 檢視（已是 Typst 的相依套件，不會額外增加體積）
 hayro = { version = "0.7", optional = true }
+# 監看書庫資料夾：有檔案新增、刪除時自動更新檔案樹
+notify = "8.2"
 
 [build-dependencies]
 # 嵌入 Windows exe 圖示（只在編譯 Windows 版時使用）

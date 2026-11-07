@@ -1,8 +1,11 @@
 //! 書庫：一個根資料夾，裡面可放散落的 Markdown 筆記、資料夾與書本。
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 
 use crate::book::is_book;
 use crate::{is_markdown, is_pdf, Result};
@@ -32,6 +35,10 @@ pub struct Entry {
     pub name: String,
     pub kind: EntryKind,
     pub children: Vec<Entry>,
+    /// 修改時間；資料夾為裡面最新的檔案
+    pub modified: Option<SystemTime>,
+    /// 建立時間（部分 Linux 檔案系統沒有，會退回修改時間）
+    pub created: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +57,37 @@ impl Library {
     pub fn refresh(&mut self) -> Result<()> {
         self.entries = scan(&self.root, 0)?;
         Ok(())
+    }
+
+    /// 依排序設定重新排列整棵樹。
+    pub fn sort(&mut self, opts: &SortOptions, order: &CustomOrder) {
+        let root = self.root.clone();
+        sort_tree(&mut self.entries, &root, &root, opts, order);
+    }
+
+    /// 找出某個路徑對應的項目。
+    pub fn find(&self, path: &Path) -> Option<&Entry> {
+        fn walk<'a>(entries: &'a [Entry], path: &Path) -> Option<&'a Entry> {
+            for e in entries {
+                if e.path == path {
+                    return Some(e);
+                }
+                if path.starts_with(&e.path) {
+                    return walk(&e.children, path);
+                }
+            }
+            None
+        }
+        walk(&self.entries, path)
+    }
+
+    /// 資料夾裡的項目（已排序）；`dir` 為書庫根目錄時回傳最上層。
+    pub fn children_of(&self, dir: &Path) -> Option<&[Entry]> {
+        if dir == self.root {
+            Some(&self.entries)
+        } else {
+            self.find(dir).map(|e| e.children.as_slice())
+        }
     }
 
     /// 所有檔案（Markdown 與 PDF，扁平），用於快速搜尋。
@@ -83,15 +121,26 @@ fn scan(dir: &Path, depth: usize) -> Result<Vec<Entry>> {
             continue;
         }
         let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() {
-            let kind = if is_book(&path) { EntryKind::Book } else { EntryKind::Dir };
-            let children = scan(&path, depth + 1).unwrap_or_default();
-            out.push(Entry { path, name, kind, children });
+        let meta = entry.metadata().ok();
+        let modified = meta.as_ref().and_then(|m| m.modified().ok());
+        let created = meta.as_ref().and_then(|m| m.created().ok()).or(modified);
+        let kind = if ft.is_dir() {
+            if is_book(&path) {
+                EntryKind::Book
+            } else {
+                EntryKind::Dir
+            }
         } else if is_markdown(&path) {
-            out.push(Entry { path, name, kind: EntryKind::Markdown, children: Vec::new() });
+            EntryKind::Markdown
         } else if is_pdf(&path) {
-            out.push(Entry { path, name, kind: EntryKind::Pdf, children: Vec::new() });
-        }
+            EntryKind::Pdf
+        } else {
+            continue;
+        };
+        let children = if ft.is_dir() { scan(&path, depth + 1).unwrap_or_default() } else { Vec::new() };
+        // 資料夾的「修改時間」取裡面最新的檔案，排序時才有意義
+        let modified = children.iter().filter_map(|c| c.modified).chain(modified).max();
+        out.push(Entry { path, name, kind, children, modified, created });
     }
     out.sort_by(|a, b| {
         let a_file = a.kind.is_file();
@@ -99,6 +148,146 @@ fn scan(dir: &Path, depth: usize) -> Result<Vec<Entry>> {
         a_file.cmp(&b_file).then_with(|| natural_cmp(&a.name, &b.name))
     });
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// 排序
+
+/// 檔案樹的排序依據。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SortKey {
+    /// 名稱（自然排序：2 在 10 之前）
+    #[default]
+    Name,
+    /// 修改時間（新的在前）
+    Modified,
+    /// 建立時間（新的在前）
+    Created,
+    /// 自訂（拖曳排列，存在 `.shosai/order.toml`）
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SortOptions {
+    pub key: SortKey,
+    /// 反過來排
+    pub reverse: bool,
+    /// 資料夾排在檔案前面（自訂排序時只用在還沒排過的項目）
+    pub folders_first: bool,
+}
+
+impl Default for SortOptions {
+    fn default() -> Self {
+        Self { key: SortKey::Name, reverse: false, folders_first: true }
+    }
+}
+
+/// 自訂排序：每個資料夾（相對於書庫，以 `/` 分隔，根目錄為空字串）裡項目的順序。
+///
+/// 存在書庫的 `.shosai/order.toml`，會跟著 Nextcloud 同步。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CustomOrder {
+    #[serde(default)]
+    pub folders: BTreeMap<String, Vec<String>>,
+}
+
+pub const ORDER_FILE: &str = ".shosai/order.toml";
+
+impl CustomOrder {
+    pub fn load(library_root: &Path) -> CustomOrder {
+        fs::read_to_string(library_root.join(ORDER_FILE)).ok().and_then(|t| toml::from_str(&t).ok()).unwrap_or_default()
+    }
+
+    pub fn save(&self, library_root: &Path) -> Result<()> {
+        let path = library_root.join(ORDER_FILE);
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let text = toml::to_string_pretty(self).map_err(|e| crate::Error::Toml(e.to_string()))?;
+        fs::write(path, text)?;
+        Ok(())
+    }
+
+    pub fn get(&self, library_root: &Path, dir: &Path) -> Option<&[String]> {
+        self.folders.get(&rel_key(library_root, dir)).map(Vec::as_slice)
+    }
+
+    pub fn set(&mut self, library_root: &Path, dir: &Path, names: Vec<String>) {
+        self.folders.insert(rel_key(library_root, dir), names);
+    }
+
+    /// 檔案改名後更新順序表中的名稱。
+    pub fn rename(&mut self, library_root: &Path, old: &Path, new: &Path) -> bool {
+        let (Some(dir), Some(old_name), Some(new_name)) = (old.parent(), old.file_name(), new.file_name()) else {
+            return false;
+        };
+        let old_name = old_name.to_string_lossy();
+        let mut changed = false;
+        if let Some(list) = self.folders.get_mut(&rel_key(library_root, dir)) {
+            for n in list.iter_mut().filter(|n| **n == old_name) {
+                *n = new_name.to_string_lossy().into_owned();
+                changed = true;
+            }
+        }
+        // 資料夾改名：底下子資料夾的鍵也要跟著改
+        let (old_key, new_key) = (rel_key(library_root, old), rel_key(library_root, new));
+        let moved: Vec<String> =
+            self.folders.keys().filter(|k| **k == old_key || k.starts_with(&format!("{old_key}/"))).cloned().collect();
+        for k in moved {
+            if let Some(v) = self.folders.remove(&k) {
+                self.folders.insert(format!("{new_key}{}", &k[old_key.len()..]), v);
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
+fn rel_key(root: &Path, dir: &Path) -> String {
+    dir.strip_prefix(root)
+        .map(|r| r.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/"))
+        .unwrap_or_default()
+}
+
+fn sort_tree(entries: &mut [Entry], root: &Path, dir: &Path, opts: &SortOptions, order: &CustomOrder) {
+    sort_level(entries, order.get(root, dir), opts);
+    for e in entries.iter_mut() {
+        if !e.children.is_empty() {
+            let path = e.path.clone();
+            sort_tree(&mut e.children, root, &path, opts, order);
+        }
+    }
+}
+
+/// 依排序設定排列一層項目。`custom` 是這個資料夾的自訂順序（沒列到的接在後面，依名稱）。
+pub fn sort_level(entries: &mut [Entry], custom: Option<&[String]>, opts: &SortOptions) {
+    use std::cmp::Ordering;
+    let by_name = |a: &Entry, b: &Entry| natural_cmp(&a.name, &b.name);
+    let group = |a: &Entry, b: &Entry| -> Ordering {
+        if opts.folders_first {
+            a.kind.is_file().cmp(&b.kind.is_file())
+        } else {
+            Ordering::Equal
+        }
+    };
+    let pos = |e: &Entry| custom.and_then(|c| c.iter().position(|n| *n == e.name)).unwrap_or(usize::MAX);
+    entries.sort_by(|a, b| {
+        let primary = match opts.key {
+            SortKey::Name => by_name(a, b),
+            // 新的在前；沒有時間的排最後
+            SortKey::Modified => b.modified.cmp(&a.modified),
+            SortKey::Created => b.created.cmp(&a.created),
+            SortKey::Custom => pos(a).cmp(&pos(b)),
+        };
+        let primary = if opts.reverse { primary.reverse() } else { primary };
+        if opts.key == SortKey::Custom {
+            // 自訂順序優先；還沒排過的項目照預設規則接在後面
+            primary.then(group(a, b)).then_with(|| by_name(a, b))
+        } else {
+            group(a, b).then(primary).then_with(|| by_name(a, b))
+        }
+    });
 }
 
 /// 自然排序：`2.md` 排在 `10.md` 之前。
@@ -254,6 +443,45 @@ mod tests {
         let mut v = vec!["10.md", "2.md", "1.md", "b.md", "A.md"];
         v.sort_by(|a, b| natural_cmp(a, b));
         assert_eq!(v, vec!["1.md", "2.md", "10.md", "A.md", "b.md"]);
+    }
+
+    fn entry(name: &str, kind: EntryKind, secs: u64) -> Entry {
+        let t = Some(UNIX_EPOCH + std::time::Duration::from_secs(secs));
+        Entry { path: PathBuf::from(name), name: name.into(), kind, children: Vec::new(), modified: t, created: t }
+    }
+
+    #[test]
+    fn sort_options() {
+        let mut v = vec![
+            entry("b.md", EntryKind::Markdown, 30),
+            entry("資料夾", EntryKind::Dir, 10),
+            entry("a.md", EntryKind::Markdown, 20),
+        ];
+        let names = |v: &[Entry]| v.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+        sort_level(&mut v, None, &SortOptions::default());
+        assert_eq!(names(&v), ["資料夾", "a.md", "b.md"]);
+        sort_level(&mut v, None, &SortOptions { key: SortKey::Modified, reverse: false, folders_first: false });
+        assert_eq!(names(&v), ["b.md", "a.md", "資料夾"]);
+        sort_level(&mut v, None, &SortOptions { key: SortKey::Name, reverse: true, folders_first: true });
+        assert_eq!(names(&v), ["資料夾", "b.md", "a.md"]);
+        let custom = vec!["b.md".to_string(), "資料夾".to_string()];
+        sort_level(&mut v, Some(&custom), &SortOptions { key: SortKey::Custom, ..Default::default() });
+        assert_eq!(names(&v), ["b.md", "資料夾", "a.md"]);
+    }
+
+    #[test]
+    fn custom_order_rename() {
+        let root = Path::new("/lib");
+        let mut o = CustomOrder::default();
+        o.set(root, root, vec!["甲".into(), "乙.md".into()]);
+        o.set(root, &root.join("甲"), vec!["x.md".into()]);
+        o.set(root, &root.join("甲/子"), vec!["y.md".into()]);
+        assert!(o.rename(root, &root.join("甲"), &root.join("丙")));
+        assert_eq!(o.get(root, root).unwrap(), ["丙", "乙.md"]);
+        assert_eq!(o.get(root, &root.join("丙")).unwrap(), ["x.md"]);
+        assert_eq!(o.get(root, &root.join("丙/子")).unwrap(), ["y.md"]);
+        let text = toml::to_string_pretty(&o).unwrap();
+        assert_eq!(toml::from_str::<CustomOrder>(&text).unwrap(), o);
     }
 
     #[test]

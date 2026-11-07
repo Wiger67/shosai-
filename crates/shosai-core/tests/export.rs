@@ -2,7 +2,9 @@
 
 use std::path::PathBuf;
 
-use shosai_core::export::{self, Document};
+use shosai_core::export;
+#[cfg(feature = "pdf")]
+use shosai_core::export::Document;
 use shosai_core::Book;
 
 fn sample() -> PathBuf {

@@ -2,19 +2,22 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui::{self, Color32, FontId, Key, KeyboardShortcut, Modifiers, RichText, TextStyle};
 use serde::{Deserialize, Serialize};
 use shosai_core::book::{is_book, BookMeta};
+use shosai_core::library::{CustomOrder, SortKey, SortOptions};
+use shosai_core::novel::NovelBook;
 use shosai_core::{library, markdown, Book, Entry, EntryKind, Library};
 
 use crate::icons::{self, Icon};
 use crate::md_view::{MdView, ViewEvent};
+use crate::novel_view::{NovelEvent, NovelPrefs, NovelView};
 use crate::pdf_view::{Fit, PdfView};
 use crate::theme::{self, Palette};
-use crate::tree::{self, TreeCtx};
+use crate::tree::{self, DragItem, Place, TreeCtx};
 
 pub fn run(open: Option<PathBuf>) -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -74,6 +77,14 @@ struct Settings {
     pdf_thumbs: bool,
     /// 每個 PDF 上次讀到的頁（從 0 起算）
     pdf_pages: HashMap<PathBuf, usize>,
+    /// 檔案樹排序
+    sort: SortOptions,
+    /// 書本模式
+    novel: NovelPrefs,
+    /// 每本書讀到哪一章的第幾個字
+    novel_pos: HashMap<PathBuf, (PathBuf, usize)>,
+    /// 上次關閉時正在用書本模式讀的資料夾
+    novel_open: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -98,6 +109,10 @@ impl Default for Settings {
             pdf_fit: Fit::Width,
             pdf_thumbs: true,
             pdf_pages: HashMap::new(),
+            sort: SortOptions::default(),
+            novel: NovelPrefs::default(),
+            novel_pos: HashMap::new(),
+            novel_open: None,
         }
     }
 }
@@ -195,6 +210,17 @@ pub(crate) enum Action {
     },
     Reveal(PathBuf),
     Refresh,
+    /// 拖放檔案樹中的項目
+    Drop {
+        src: PathBuf,
+        target: PathBuf,
+        place: Place,
+    },
+    /// 以書本模式閱讀資料夾（可指定從哪一章開始）
+    OpenNovel {
+        root: PathBuf,
+        chapter: Option<PathBuf>,
+    },
     #[cfg_attr(not(feature = "nextcloud"), allow(dead_code))]
     Sync,
 }
@@ -232,6 +258,85 @@ pub struct ShosaiApp {
     window_title: String,
     /// SHOSAI_FRAME_STATS：每秒印出重畫次數（檢查閒置時是否真的不重畫）
     frame_stats: Option<(Instant, u32)>,
+    /// 自訂排序（`.shosai/order.toml`）
+    order: CustomOrder,
+    /// 監看書庫資料夾，有檔案新增 / 刪除 / 修改時自動更新檔案樹
+    watcher: Option<FsWatcher>,
+    /// 書本模式
+    novel: Option<NovelView>,
+}
+
+/// 檔案監看：背景執行緒收到變動後記下時間，畫面在停止變動一小段時間後才重新整理
+/// （同步軟體一次寫入很多檔案時只會更新一次）。
+struct FsWatcher {
+    _watcher: notify::RecommendedWatcher,
+    changed: Changed,
+}
+
+/// 最後一次變動的時間，以及這段期間變動過的路徑。
+type Changed = Arc<Mutex<Option<(Instant, HashSet<PathBuf>)>>>;
+
+const FS_DEBOUNCE: Duration = Duration::from_millis(300);
+
+impl FsWatcher {
+    fn start(root: &Path, ctx: &egui::Context) -> Option<FsWatcher> {
+        use notify::Watcher;
+        let changed: Changed = Arc::default();
+        let (c, ctx, root_buf) = (changed.clone(), ctx.clone(), root.to_path_buf());
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            let Ok(ev) = res else { return };
+            if matches!(ev.kind, notify::EventKind::Access(_)) {
+                return;
+            }
+            let paths: Vec<PathBuf> = ev.paths.into_iter().filter(|p| fs_relevant(&root_buf, p)).collect();
+            if paths.is_empty() {
+                return;
+            }
+            let mut guard = c.lock().unwrap();
+            let entry = guard.get_or_insert_with(|| (Instant::now(), HashSet::new()));
+            entry.0 = Instant::now();
+            entry.1.extend(paths);
+            ctx.request_repaint_after(FS_DEBOUNCE + Duration::from_millis(20));
+        })
+        .ok()?;
+        watcher.watch(root, notify::RecursiveMode::Recursive).ok()?;
+        Some(FsWatcher { _watcher: watcher, changed })
+    }
+
+    /// 停止變動夠久了 → 取出變動的路徑；還在變動 → 回傳 None 並安排稍後再檢查。
+    fn take(&self, ctx: &egui::Context) -> Option<HashSet<PathBuf>> {
+        let mut guard = self.changed.lock().unwrap();
+        let (since, _) = guard.as_ref()?;
+        let elapsed = since.elapsed();
+        if elapsed < FS_DEBOUNCE {
+            ctx.request_repaint_after(FS_DEBOUNCE - elapsed);
+            return None;
+        }
+        guard.take().map(|(_, p)| p)
+    }
+}
+
+/// 只有會影響檔案樹或書本模式的變動才需要處理（略過隱藏資料夾、回收桶、暫存檔）。
+fn fs_relevant(root: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else { return false };
+    let rel_s = rel.to_string_lossy().replace('\\', "/");
+    if rel_s == library::ORDER_FILE {
+        return true;
+    }
+    if rel.components().any(|c| {
+        let c = c.as_os_str().to_string_lossy();
+        c.starts_with('.') || library::IGNORED_DIRS.contains(&c.as_ref())
+    }) {
+        return false;
+    }
+    match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()) {
+        // 沒有副檔名：多半是資料夾
+        None => true,
+        Some(ext) => matches!(
+            ext.as_str(),
+            "md" | "markdown" | "mdown" | "mkd" | "pdf" | "toml" | "png" | "jpg" | "jpeg" | "webp" | "gif"
+        ),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -297,6 +402,9 @@ impl ShosaiApp {
             scale_draft: None,
             window_title: String::new(),
             frame_stats: std::env::var_os("SHOSAI_FRAME_STATS").map(|_| (Instant::now(), 0)),
+            order: CustomOrder::default(),
+            watcher: None,
+            novel: None,
         };
 
         // 決定開啟的書庫與檔案：命令列參數 > 上次狀態
@@ -319,6 +427,10 @@ impl ShosaiApp {
                     if let Some(last) = app.settings.last_file.clone().filter(|f| f.is_file()) {
                         app.open_file(&last);
                     }
+                    if let Some(novel) = app.settings.novel_open.clone().filter(|d| d.is_dir() && d.starts_with(&root))
+                    {
+                        app.open_novel(&novel, None);
+                    }
                 }
             }
         }
@@ -335,7 +447,11 @@ impl ShosaiApp {
                 self.settings.recent_libraries.retain(|r| r != root);
                 self.settings.recent_libraries.insert(0, root.to_path_buf());
                 self.settings.recent_libraries.truncate(8);
+                self.order = CustomOrder::load(root);
                 self.library = Some(lib);
+                self.novel = None;
+                self.watcher = FsWatcher::start(root, &self.ctx);
+                self.resort();
                 self.reload_books();
             }
             Err(e) => self.error(format!("無法開啟資料夾：{e}")),
@@ -348,7 +464,204 @@ impl ShosaiApp {
                 self.status = Some(Status::Error(e.to_string(), Instant::now()));
             }
         }
+        self.resort();
         self.reload_books();
+        self.refresh_novel();
+    }
+
+    /// 依目前的排序設定重排檔案樹。
+    fn resort(&mut self) {
+        if let Some(lib) = self.library.as_mut() {
+            lib.sort(&self.settings.sort, &self.order);
+        }
+    }
+
+    /// 檔案監看回報變動。
+    fn on_fs_change(&mut self, paths: HashSet<PathBuf>) {
+        // 只是自己剛存檔的那個檔案 → 不用整個重新整理
+        if let Some(doc) = &self.doc {
+            if paths.iter().all(|p| *p == doc.path) && mtime(&doc.path) == doc.mtime {
+                return;
+            }
+        }
+        if paths.iter().any(|p| p.ends_with(library::ORDER_FILE)) {
+            if let Some(root) = self.library.as_ref().map(|l| l.root.clone()) {
+                self.order = CustomOrder::load(&root);
+            }
+        }
+        self.reload_if_changed();
+        self.refresh();
+    }
+
+    // -----------------------------------------------------------------------
+    // 書本模式
+
+    /// 以書本模式開啟資料夾。`chapter` 指定從哪一章開始（否則回到上次讀的位置）。
+    fn open_novel(&mut self, root: &Path, chapter: Option<&Path>) {
+        let Some(book) = self.novel_book(root) else {
+            self.error("找不到這個資料夾");
+            return;
+        };
+        if book.chapters.is_empty() {
+            self.info("這個資料夾裡沒有 Markdown 檔");
+            return;
+        }
+        self.save_current();
+        let saved = self.settings.novel_pos.get(root).cloned();
+        let at = match chapter {
+            Some(c) => match saved {
+                // 指定的章就是上次讀的那章 → 回到上次的位置
+                Some((p, off)) if p == c => Some((p, off)),
+                _ => Some((c.to_path_buf(), 0)),
+            },
+            None => saved,
+        };
+        self.novel = Some(NovelView::open(book, at));
+        self.settings.novel_open = Some(root.to_path_buf());
+    }
+
+    fn novel_book(&self, root: &Path) -> Option<NovelBook> {
+        let lib = self.library.as_ref()?;
+        let children = lib.children_of(root)?;
+        Some(NovelBook::new(root, children, self.books.get(root)))
+    }
+
+    fn refresh_novel(&mut self) {
+        let Some(root) = self.novel.as_ref().map(|n| n.book.root.clone()) else { return };
+        match self.novel_book(&root) {
+            Some(book) => {
+                if let Some(n) = self.novel.as_mut() {
+                    if n.book != book {
+                        n.update_book(book);
+                    }
+                }
+            }
+            None => self.close_novel(false),
+        }
+    }
+
+    /// 結束書本模式；`open_chapter` 時把正在讀的那一章開進一般的閱讀畫面。
+    fn close_novel(&mut self, open_chapter: bool) {
+        let Some(n) = self.novel.take() else { return };
+        if let Some(pos) = n.position() {
+            self.settings.novel_pos.insert(n.book.root.clone(), pos);
+        }
+        self.settings.novel_open = None;
+        if open_chapter {
+            if let Some(ch) = n.current_chapter() {
+                if self.doc.as_ref().is_none_or(|d| d.path != ch) {
+                    let ch = ch.to_path_buf();
+                    self.open_file(&ch);
+                }
+            }
+            if self.settings.view == ViewMode::Edit {
+                self.settings.view = ViewMode::Read;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 拖放與排序
+
+    /// 檔案或資料夾被移動 / 改名後，更新所有記著舊路徑的地方。
+    fn relocate(&mut self, old: &Path, new: &Path) {
+        let moved = |p: &Path| -> Option<PathBuf> {
+            let rest = p.strip_prefix(old).ok()?;
+            Some(if rest.as_os_str().is_empty() { new.to_path_buf() } else { new.join(rest) })
+        };
+        if let Some(doc) = self.doc.as_mut() {
+            if let Some(p) = moved(&doc.path) {
+                doc.path = p.clone();
+                self.settings.last_file = Some(p);
+            }
+        }
+        if self.pdf.as_ref().is_some_and(|p| p.path.starts_with(old)) {
+            self.pdf = None;
+        }
+        if self.novel.as_ref().is_some_and(|n| n.book.root.starts_with(old)) {
+            self.close_novel(false);
+        }
+        let expanded: Vec<PathBuf> = self.settings.expanded.iter().filter(|p| p.starts_with(old)).cloned().collect();
+        for p in expanded {
+            self.settings.expanded.remove(&p);
+            if let Some(n) = moved(&p) {
+                self.settings.expanded.insert(n);
+            }
+        }
+        if let Some(root) = self.library.as_ref().map(|l| l.root.clone()) {
+            if self.order.rename(&root, old, new) {
+                let _ = self.order.save(&root);
+            }
+        }
+    }
+
+    /// 處理檔案樹的拖放：移到別的資料夾，或在同一個資料夾裡調整順序。
+    fn drop_item(&mut self, src: PathBuf, target: PathBuf, place: Place) -> Result<(), String> {
+        let root = self.library.as_ref().map(|l| l.root.clone()).ok_or("沒有開啟書庫")?;
+        let dest_dir = match place {
+            Place::Into => target.clone(),
+            _ => target.parent().map(Path::to_path_buf).ok_or("無效的位置")?,
+        };
+        if !dest_dir.starts_with(&root) {
+            return Err("只能移到書庫裡".into());
+        }
+        if dest_dir.starts_with(&src) {
+            return Err("不能把資料夾移到自己裡面".into());
+        }
+        self.save_current();
+        let mut item = src.clone();
+        if src.parent() != Some(dest_dir.as_path()) {
+            item = library::move_into(&src, &dest_dir).map_err(|e| e.to_string())?;
+            self.relocate(&src, &item);
+            self.refresh();
+            if place == Place::Into {
+                let name = dest_dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.info(format!("已移到「{name}」"));
+            }
+        }
+        if place == Place::Into {
+            return Ok(());
+        }
+
+        // 書本裡的章節：調整 book.toml 的章節順序
+        let book_root =
+            self.books.values().find(|b| b.chapters.iter().any(|c| c.path == target)).map(|b| b.root.clone());
+        if let Some(book_root) = book_root {
+            let mut book = Book::open(&book_root).map_err(|e| e.to_string())?;
+            let rel_of = |p: &Path| book.chapters.iter().find(|c| c.path == p).map(|c| c.rel.clone());
+            if let (Some(from), Some(to)) = (rel_of(&item), rel_of(&target)) {
+                let list = &mut book.meta.chapters;
+                list.retain(|c| *c != from);
+                let at = list.iter().position(|c| *c == to).unwrap_or(list.len());
+                list.insert(if place == Place::After { at + 1 } else { at }, from);
+                book.save().map_err(|e| e.to_string())?;
+                self.refresh();
+                return Ok(());
+            }
+        }
+
+        // 一般資料夾：寫入自訂排序
+        let names: Vec<String> = self
+            .library
+            .as_ref()
+            .and_then(|l| l.children_of(&dest_dir))
+            .map(|c| c.iter().map(|e| e.name.clone()).collect())
+            .unwrap_or_default();
+        let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let (item_name, target_name) = (name(&item), name(&target));
+        let mut names: Vec<String> = names.into_iter().filter(|n| *n != item_name).collect();
+        let at = names.iter().position(|n| *n == target_name).unwrap_or(names.len());
+        names.insert(if place == Place::After { at + 1 } else { at }, item_name);
+        self.order.set(&root, &dest_dir, names);
+        self.order.save(&root).map_err(|e| e.to_string())?;
+        if self.settings.sort.key != SortKey::Custom {
+            self.settings.sort.key = SortKey::Custom;
+            self.settings.sort.reverse = false;
+            self.info("已改用自訂排序（可在側欄的排序按鈕切換回來）");
+        }
+        self.resort();
+        self.refresh_novel();
+        Ok(())
     }
 
     fn reload_books(&mut self) {
@@ -473,6 +786,9 @@ impl ShosaiApp {
     }
 
     fn current_path(&self) -> Option<&Path> {
+        if let Some(ch) = self.novel.as_ref().and_then(|n| n.current_chapter()) {
+            return Some(ch);
+        }
         self.doc.as_ref().map(|d| d.path.as_path()).or(self.pdf.as_ref().map(|p| p.path.as_path()))
     }
 
@@ -482,10 +798,19 @@ impl ShosaiApp {
             return book.chapters.iter().map(|c| (c.path.clone(), c.title.clone())).collect();
         }
         let Some(dir) = path.parent() else { return Vec::new() };
-        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| shosai_core::is_markdown(p)).collect())
-            .unwrap_or_default();
-        files.sort_by(|a, b| library::natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
+        // 依檔案樹目前的排序
+        let from_tree: Option<Vec<PathBuf>> = self
+            .library
+            .as_ref()
+            .and_then(|l| l.children_of(dir))
+            .map(|c| c.iter().filter(|e| e.kind == EntryKind::Markdown).map(|e| e.path.clone()).collect());
+        let files = from_tree.unwrap_or_else(|| {
+            let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+                .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| shosai_core::is_markdown(p)).collect())
+                .unwrap_or_default();
+            files.sort_by(|a, b| library::natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
+            files
+        });
         files
             .into_iter()
             .map(|p| {
@@ -636,7 +961,22 @@ impl ShosaiApp {
     fn process_actions(&mut self, ctx: &egui::Context) {
         for action in std::mem::take(&mut self.actions) {
             match action {
-                Action::Open(p) => self.open_file(&p),
+                Action::Open(p) => {
+                    // 書本模式中點了同一本書的章節 → 直接翻到那一章
+                    if let Some(n) = self.novel.as_mut() {
+                        if n.goto_chapter(&p) {
+                            continue;
+                        }
+                        self.close_novel(false);
+                    }
+                    self.open_file(&p)
+                }
+                Action::Drop { src, target, place } => {
+                    if let Err(e) = self.drop_item(src, target, place) {
+                        self.error(e);
+                    }
+                }
+                Action::OpenNovel { root, chapter } => self.open_novel(&root, chapter.as_deref()),
                 Action::OpenLibrary(p) => {
                     self.save_current();
                     self.doc = None;
@@ -686,12 +1026,13 @@ impl ShosaiApp {
         if settings {
             self.show_settings = !self.show_settings;
         }
-        let (save, edit, split, read, sidebar, new_note, zoom_in, zoom_out) = ctx.input_mut(|i| {
+        let (save, edit, split, read, book_mode, sidebar, new_note, zoom_in, zoom_out) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::S)),
                 i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::Num1)),
                 i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::Num2)),
                 i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::Num3)),
+                i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::Num4)),
                 i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::B)),
                 i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::N)),
                 i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::Equals))
@@ -712,6 +1053,12 @@ impl ShosaiApp {
         if read {
             self.settings.view = ViewMode::Read;
         }
+        if (edit || split || read) && self.novel.is_some() {
+            self.close_novel(true);
+        }
+        if book_mode && self.novel.is_none() {
+            self.open_novel_here();
+        }
         if sidebar {
             self.settings.sidebar = !self.settings.sidebar;
         }
@@ -721,7 +1068,10 @@ impl ShosaiApp {
             }
         }
         if zoom_in || zoom_out {
-            if let Some(pdf) = self.pdf.as_mut() {
+            if self.novel.is_some() {
+                let f = &mut self.settings.novel.font_size;
+                *f = (*f + if zoom_in { 1.0 } else { -1.0 }).clamp(12.0, 32.0);
+            } else if let Some(pdf) = self.pdf.as_mut() {
                 pdf.zoom_by(if zoom_in { 1.2 } else { 1.0 / 1.2 });
             } else {
                 let d = if zoom_in { 1.0 } else { -1.0 };
@@ -792,7 +1142,10 @@ impl ShosaiApp {
             }
             ui.add_space(10.0);
 
-            if self.doc.is_some() {
+            let mut novel_events = Vec::new();
+            if let Some(n) = self.novel.as_mut() {
+                n.toolbar_left(ui, &mut self.settings.novel, &mut novel_events);
+            } else if self.doc.is_some() {
                 self.mode_switch(ui);
             } else if let Some(pdf) = self.pdf.as_mut() {
                 pdf.toolbar_left(ui, pal);
@@ -801,7 +1154,9 @@ impl ShosaiApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 self.more_menu(ui);
-                if let Some(pdf) = self.pdf.as_mut() {
+                if let Some(n) = self.novel.as_mut() {
+                    n.toolbar_right(ui, &mut self.settings.novel);
+                } else if let Some(pdf) = self.pdf.as_mut() {
                     if icons::button(ui, Icon::External, "用預設程式開啟").clicked() {
                         self.actions.push(Action::Reveal(pdf.path.clone()));
                     }
@@ -811,7 +1166,16 @@ impl ShosaiApp {
                     self.export_menu(ui);
                 }
             });
+            self.handle_novel_events(novel_events);
         });
+    }
+
+    fn handle_novel_events(&mut self, events: Vec<NovelEvent>) {
+        for ev in events {
+            match ev {
+                NovelEvent::Close => self.close_novel(true),
+            }
+        }
     }
 
     /// 編輯 / 分割 / 閱讀 的分段切換。
@@ -830,7 +1194,21 @@ impl ShosaiApp {
                     self.settings.view = mode;
                 }
             }
+            let btn = egui::Button::selectable(false, "書本").corner_radius(6).min_size(egui::vec2(52.0, 24.0));
+            if ui.add(btn).on_hover_text("以書本模式閱讀這個資料夾，從這一章開始（Ctrl+4）").clicked()
+            {
+                self.open_novel_here();
+            }
         });
+    }
+
+    /// 以書本模式閱讀目前檔案所在的書 / 資料夾，從目前這一章開始。
+    fn open_novel_here(&mut self) {
+        let Some(path) = self.doc.as_ref().map(|d| d.path.clone()) else { return };
+        let root = self.book_of(&path).map(|b| b.root.clone()).or_else(|| path.parent().map(Path::to_path_buf));
+        if let Some(root) = root {
+            self.open_novel(&root, Some(&path));
+        }
     }
 
     fn export_menu(&mut self, ui: &mut egui::Ui) {
@@ -900,6 +1278,14 @@ impl ShosaiApp {
     fn status_bar(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
+            if let Some(n) = &self.novel {
+                let (left, right) = n.status();
+                ui.label(RichText::new(left).small().color(pal.weak));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(right).small().color(pal.weak));
+                });
+                return;
+            }
             // 左：目前檔案位置
             if let Some(path) = self.current_path().map(Path::to_path_buf) {
                 let rel = self
@@ -1001,6 +1387,8 @@ impl ShosaiApp {
             let resp = ui.add(name).on_hover_text(root.display().to_string());
             egui::Popup::menu(&resp).show(|ui| {
                 ui.set_min_width(220.0);
+                tree::novel_item(ui, &root, &mut self.actions);
+                ui.separator();
                 if ui.button("開啟其他資料夾…").clicked() {
                     self.actions.push(Action::PickLibrary);
                     ui.close();
@@ -1031,6 +1419,40 @@ impl ShosaiApp {
                 if icons::button_sized(ui, Icon::Collapse, "全部收合", 26.0).clicked() {
                     self.settings.expanded.clear();
                 }
+                let sort = icons::button_sized(ui, Icon::Sort, "排序方式", 26.0);
+                egui::Popup::menu(&sort).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                    ui.set_min_width(200.0);
+                    ui.set_max_width(240.0);
+                    let before = self.settings.sort;
+                    let st = &mut self.settings.sort;
+                    ui.label(RichText::new("排序依據").weak().small());
+                    for (key, label) in [
+                        (SortKey::Name, "名稱"),
+                        (SortKey::Modified, "修改時間（新的在前）"),
+                        (SortKey::Created, "建立時間（新的在前）"),
+                        (SortKey::Custom, "自訂（拖曳排列）"),
+                    ] {
+                        ui.radio_value(&mut st.key, key, label);
+                    }
+                    ui.separator();
+                    ui.checkbox(&mut st.reverse, "反向排列");
+                    ui.checkbox(&mut st.folders_first, "資料夾排在前面");
+                    ui.add_space(2.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "拖曳檔案可以調整順序；拖到資料夾上可以移進去，拖到清單下方空白處會移到最上層。",
+                            )
+                            .small()
+                            .color(pal.weak),
+                        )
+                        .wrap(),
+                    );
+                    if self.settings.sort != before {
+                        self.resort();
+                        self.refresh_novel();
+                    }
+                });
                 #[cfg(feature = "nextcloud")]
                 {
                     let busy = self.sync_job.is_some();
@@ -1108,6 +1530,8 @@ impl ShosaiApp {
                     name: root_name.clone(),
                     kind: EntryKind::Book,
                     children: lib.entries.clone(),
+                    modified: None,
+                    created: None,
                 };
                 tree::book_contents(ui, book, &entry, 0, &mut cx);
             } else if lib.entries.is_empty() {
@@ -1118,7 +1542,50 @@ impl ShosaiApp {
             } else {
                 tree::entries(ui, &lib.entries, 0, &mut cx);
             }
+            // 拖到清單下方的空白處 → 移到書庫最上層
+            let rest = ui.available_rect_before_wrap();
+            let rest = egui::Rect::from_min_size(rest.min, egui::vec2(rest.width(), rest.height().max(48.0)));
+            let resp = ui.allocate_rect(rest, egui::Sense::hover());
+            if let Some(item) = resp.dnd_hover_payload::<DragItem>() {
+                if item.0.parent() != Some(root.as_path()) {
+                    let r = egui::Rect::from_min_size(rest.min, egui::vec2(rest.width(), 36.0));
+                    ui.painter().rect_stroke(
+                        r.shrink(1.0),
+                        6.0,
+                        egui::Stroke::new(1.5, pal.accent),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "移到書庫最上層",
+                        FontId::proportional(12.5),
+                        pal.accent,
+                    );
+                    if resp.dnd_release_payload::<DragItem>().is_some() {
+                        self.actions.push(Action::Drop {
+                            src: item.0.clone(),
+                            target: root.clone(),
+                            place: Place::Into,
+                        });
+                    }
+                }
+            }
         });
+
+        // 拖曳中：在游標旁顯示檔名
+        if let (Some(item), Some(pos)) =
+            (egui::DragAndDrop::payload::<DragItem>(ui.ctx()), ui.ctx().pointer_latest_pos())
+        {
+            let name = item.0.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("shosai-drag"));
+            let p = ui.ctx().layer_painter(layer);
+            let galley = p.layout_no_wrap(name, FontId::proportional(13.0), pal.ink);
+            let r = egui::Rect::from_min_size(pos + egui::vec2(14.0, 6.0), galley.size() + egui::vec2(16.0, 8.0));
+            p.rect_filled(r, 6.0, pal.chrome);
+            p.rect_stroke(r, 6.0, egui::Stroke::new(1.0, pal.guide), egui::StrokeKind::Inside);
+            p.galley(r.min + egui::vec2(8.0, 4.0), galley, pal.ink);
+        }
     }
 
     fn editor(&mut self, ui: &mut egui::Ui, centered: bool) {
@@ -1455,6 +1922,31 @@ impl ShosaiApp {
                 ui.add(egui::Slider::new(&mut st.reader_width, 480.0..=1200.0).step_by(20.0).suffix(" px"));
                 hint(ui, "閱讀模式中，紙張內文的最大寬度。");
                 hint(ui, "閱讀時可用 ← → 翻到上一章 / 下一章，Ctrl+= / Ctrl+- 調整字級。");
+
+                heading(ui, "書本模式");
+                hint(ui, "把整個資料夾當成一本書，一頁一頁翻著讀：Markdown 檔是章、子資料夾是卷，名為 cover 或「封面」的圖片會當成封面。在側欄的資料夾按右鍵，或在檔案上方切換到「書本」（Ctrl+4）即可開始。");
+                let nv = &mut st.novel;
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut nv.vertical, true, "直排（由右至左）");
+                    ui.selectable_value(&mut nv.vertical, false, "橫排");
+                });
+                ui.checkbox(&mut nv.spread, "視窗夠寬時左右兩頁並排");
+                ui.add(egui::Slider::new(&mut nv.font_size, 12.0..=32.0).step_by(1.0).suffix(" px").text("字級"));
+                ui.add(egui::Slider::new(&mut nv.line_spacing, 1.3..=2.6).step_by(0.1).suffix(" 倍").text("行距"));
+                ui.horizontal(|ui| {
+                    ui.label("段首縮排");
+                    for (n, label) in [(0, "不縮排"), (1, "一字"), (2, "兩字")] {
+                        ui.selectable_value(&mut nv.indent, n, label);
+                    }
+                });
+                ui.checkbox(&mut nv.para_gap, "段落之間空半行");
+                hint(ui, "注音寫法：｜漢字《かんじ》。*強調* 會顯示成著重號，--- 或 ◇◇◇ 為場景分隔，單獨一行的圖片會成為插圖頁。");
+                ui.horizontal(|ui| {
+                    ui.label(format!("已記住 {} 本書的閱讀位置", st.novel_pos.len()));
+                    if ui.add_enabled(!st.novel_pos.is_empty(), egui::Button::new("清除")).clicked() {
+                        st.novel_pos.clear();
+                    }
+                });
             }
             SettingsTab::Pdf => {
                 heading(ui, "開啟 PDF 時的縮放");
@@ -1480,10 +1972,30 @@ impl ShosaiApp {
                 heading(ui, "檔案樹");
                 ui.checkbox(&mut st.show_pdfs, "顯示 PDF 檔");
                 ui.checkbox(&mut st.show_counts, "在資料夾與書本旁顯示檔案數量");
+                heading(ui, "排序");
+                let before = st.sort;
+                ui.horizontal_wrapped(|ui| {
+                    for (key, label) in [
+                        (SortKey::Name, "名稱"),
+                        (SortKey::Modified, "修改時間"),
+                        (SortKey::Created, "建立時間"),
+                        (SortKey::Custom, "自訂"),
+                    ] {
+                        ui.selectable_value(&mut st.sort.key, key, label);
+                    }
+                });
+                ui.checkbox(&mut st.sort.reverse, "反向排列");
+                ui.checkbox(&mut st.sort.folders_first, "資料夾排在前面（自訂排序時用於還沒排過的項目）");
+                hint(ui, "在側欄拖曳檔案即可自訂順序（會自動切換為「自訂」），順序存在書庫的 .shosai/order.toml，會跟著 Nextcloud 同步。書本的章節順序則存在 book.toml。");
+                let sort_changed = st.sort != before;
                 if ui.button("全部收合").clicked() {
                     st.expanded.clear();
                 }
                 hint(ui, "顏色：資料夾為黃色、書本為橘色、Markdown 為藍色、PDF 為紅色。");
+                if sort_changed {
+                    self.resort();
+                    self.refresh_novel();
+                }
             }
             SettingsTab::Library => {
                 heading(ui, "目前的書庫");
@@ -1634,6 +2146,9 @@ impl ShosaiApp {
                             ("Ctrl+S", "儲存（也會自動儲存）"),
                             ("Ctrl+N", "新增筆記"),
                             ("Ctrl+1 / 2 / 3", "編輯 / 分割 / 閱讀"),
+                            ("Ctrl+4", "書本模式（從這一章開始）"),
+                            ("← → 空白鍵", "書本模式翻頁（直排時 ← 是下一頁）"),
+                            ("T / Esc", "書本模式：目錄 / 結束"),
                             ("Ctrl+B", "顯示 / 隱藏側欄"),
                             ("Ctrl+= / Ctrl+-", "放大 / 縮小（PDF 為縮放）"),
                             ("← / →", "閱讀模式翻章；PDF 翻頁"),
@@ -1723,22 +2238,9 @@ impl ShosaiApp {
                 if name.trim().is_empty() {
                     return Ok(());
                 }
-                let was_open = self.doc.as_ref().map(|d| d.path.starts_with(&path)).unwrap_or(false);
                 self.save_current();
                 let new = library::rename(&path, &name).map_err(|e| e.to_string())?;
-                if was_open {
-                    if let Some(doc) = self.doc.as_mut() {
-                        let rest = doc.path.strip_prefix(&path).map(Path::to_path_buf).unwrap_or_default();
-                        doc.path = if rest.as_os_str().is_empty() { new.clone() } else { new.join(rest) };
-                        self.settings.last_file = Some(doc.path.clone());
-                    }
-                }
-                if self.pdf.as_ref().is_some_and(|p| p.path.starts_with(&path)) {
-                    self.pdf = None;
-                }
-                if self.settings.expanded.remove(&path) {
-                    self.settings.expanded.insert(new.clone());
-                }
+                self.relocate(&path, &new);
                 if lib_root.as_deref() == Some(path.as_path()) {
                     self.open_library(&new);
                 } else {
@@ -1752,6 +2254,9 @@ impl ShosaiApp {
                 }
                 if self.pdf.as_ref().is_some_and(|p| p.path.starts_with(&path)) {
                     self.pdf = None;
+                }
+                if self.novel.as_ref().is_some_and(|n| n.book.root.starts_with(&path)) {
+                    self.close_novel(false);
                 }
                 library::trash(&root, &path).map_err(|e| e.to_string())?;
                 self.refresh();
@@ -1791,6 +2296,9 @@ impl eframe::App for ShosaiApp {
         self.apply_theme(&ctx);
         self.shortcuts(&ctx);
         self.poll_export();
+        if let Some(changed) = self.watcher.as_ref().and_then(|w| w.take(&ctx)) {
+            self.on_fs_change(changed);
+        }
         let pal = theme::palette(ui.visuals().dark_mode);
 
         egui::Panel::top("toolbar")
@@ -1818,7 +2326,21 @@ impl eframe::App for ShosaiApp {
         self.settings.sidebar = sidebar_open;
 
         let surface = egui::Frame::new().fill(pal.surface);
-        if self.pdf.is_some() {
+        if self.novel.is_some() {
+            let mut events = Vec::new();
+            let prefs = self.settings.novel;
+            egui::CentralPanel::no_frame().show(ui, |ui| {
+                if let Some(n) = self.novel.as_mut() {
+                    n.show(ui, &pal, &prefs, &mut events);
+                }
+            });
+            if let Some(pos) = self.novel.as_ref().and_then(|n| n.position().map(|p| (n.book.root.clone(), p))) {
+                if self.settings.novel_pos.get(&pos.0) != Some(&pos.1) {
+                    self.settings.novel_pos.insert(pos.0, pos.1);
+                }
+            }
+            self.handle_novel_events(events);
+        } else if self.pdf.is_some() {
             egui::CentralPanel::no_frame().show(ui, |ui| {
                 if let Some(pdf) = self.pdf.as_mut() {
                     pdf.show(ui, &pal);
@@ -1910,6 +2432,9 @@ impl eframe::App for ShosaiApp {
 
         // 視窗標題
         let title = match (&self.doc, self.current_path()) {
+            _ if self.novel.is_some() => {
+                format!("{} — 書齋", self.novel.as_ref().map(|n| n.book.title.as_str()).unwrap_or(""))
+            }
             (Some(d), _) => format!(
                 "{}{} — 書齋",
                 if d.dirty { "● " } else { "" },

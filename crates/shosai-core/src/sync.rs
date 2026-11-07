@@ -493,6 +493,10 @@ fn conflict_name(rel: &str) -> String {
 }
 
 fn is_ignored(rel: &str) -> bool {
+    // 自訂排序要跟著同步，讓每台電腦看到的順序一樣
+    if rel == crate::library::ORDER_FILE || rel == ".shosai" {
+        return false;
+    }
     rel.split('/').any(|p| p.starts_with('.') || p == "target" || p == "node_modules") || rel.ends_with(".shosai-tmp")
 }
 
@@ -628,6 +632,8 @@ mod tests {
         assert!(conflict_name("書/a.md").starts_with("書/a (衝突 "));
         assert!(conflict_name("書/a.md").ends_with(").md"));
         assert!(is_ignored(".shosai/sync-state.toml"));
+        assert!(is_ignored(".shosai/nextcloud.toml"));
+        assert!(!is_ignored(".shosai/order.toml"));
         assert!(!is_ignored("書/a.md"));
     }
 }

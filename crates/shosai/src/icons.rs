@@ -30,6 +30,12 @@ pub enum Icon {
     FitPage,
     Spread,
     Thumbnails,
+    /// 目錄（清單）
+    List,
+    /// 文字設定（Aa）
+    Text,
+    /// 排序
+    Sort,
 }
 
 /// 圖示按鈕：平時只有圖示，滑過時出現淡淡的底色。
@@ -75,6 +81,9 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
             | Icon::FitPage
             | Icon::Spread
             | Icon::Thumbnails
+            | Icon::List
+            | Icon::Text
+            | Icon::Sort
     ) {
         return paint_more(p, r, icon, s);
     }
@@ -206,6 +215,26 @@ fn paint_more(p: &Painter, r: Rect, icon: Icon, s: Stroke) {
         Icon::Thumbnails => {
             for (x, y) in [(0.1, 0.1), (0.56, 0.1), (0.1, 0.56), (0.56, 0.56)] {
                 p.rect_stroke(Rect::from_min_size(at(x, y), r.size() * 0.34), 1.5, s, egui::StrokeKind::Middle);
+            }
+        }
+        Icon::List => {
+            for y in [0.25, 0.5, 0.75] {
+                p.circle_filled(at(0.14, y), 1.3, s.color);
+                p.line_segment([at(0.32, y), at(0.9, y)], s);
+            }
+        }
+        Icon::Text => {
+            // 大 A 與小 a
+            p.add(Shape::line(vec![at(0.04, 0.86), at(0.3, 0.14), at(0.56, 0.86)], s));
+            p.line_segment([at(0.14, 0.6), at(0.46, 0.6)], s);
+            p.circle_stroke(at(0.78, 0.7), r.width() * 0.15, s);
+            p.line_segment([at(0.93, 0.48), at(0.93, 0.86)], s);
+        }
+        Icon::Sort => {
+            p.line_segment([at(0.3, 0.12), at(0.3, 0.88)], s);
+            p.add(Shape::line(vec![at(0.12, 0.7), at(0.3, 0.88), at(0.48, 0.7)], s));
+            for (y, w) in [(0.22, 0.88), (0.5, 0.78), (0.78, 0.68)] {
+                p.line_segment([at(0.6, y), at(w + 0.06, y)], s);
             }
         }
         _ => {}

@@ -12,6 +12,7 @@ pub mod hmd;
 pub mod library;
 pub mod markdown;
 pub mod math;
+pub mod novel;
 #[cfg(feature = "nextcloud")]
 pub mod sync;
 

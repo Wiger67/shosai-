@@ -11,7 +11,9 @@
 mod app;
 mod cli;
 mod icons;
+mod images;
 mod md_view;
+mod novel_view;
 mod pdf_view;
 mod theme;
 mod tree;

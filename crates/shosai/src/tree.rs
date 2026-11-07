@@ -5,6 +5,7 @@
 //! - 展開的資料夾畫出縮排導引線
 //! - 資料夾與書本右側顯示裡面有幾個檔案
 //! - 書本章節用編號徽章標示順序
+//! - 拖曳列可以調整順序（自訂排序）或移到別的資料夾
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -18,6 +19,17 @@ use crate::theme::Palette;
 
 const ROW_H: f32 = 28.0;
 const INDENT: f32 = 16.0;
+
+/// 拖曳中的項目（檔案或資料夾路徑）。
+pub struct DragItem(pub PathBuf);
+
+/// 放下的位置：目標的前面、後面，或放進目標資料夾裡。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    Before,
+    After,
+    Into,
+}
 
 pub struct TreeCtx<'a> {
     pub current: Option<&'a Path>,
@@ -43,11 +55,14 @@ struct RowSpec<'a> {
     /// 目前檔案所在的資料夾：箭頭用強調色
     on_path: bool,
     hover: Option<&'a str>,
+    /// 可以拖曳
+    draggable: bool,
 }
 
 fn row(ui: &mut Ui, spec: RowSpec, pal: &Palette) -> egui::Response {
     let width = ui.available_width();
-    let (rect, mut resp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::click());
+    let sense = if spec.draggable { Sense::click_and_drag() } else { Sense::click() };
+    let (rect, mut resp) = ui.allocate_exact_size(vec2(width, ROW_H), sense);
     if let Some(h) = spec.hover {
         resp = resp.on_hover_text(h);
     }
@@ -108,6 +123,43 @@ fn row(ui: &mut Ui, spec: RowSpec, pal: &Palette) -> egui::Response {
     resp
 }
 
+/// 拖放：這一列可以被拖走，也可以接收別的列。`into` 表示可以放進去（資料夾、書本）。
+fn dnd(ui: &Ui, resp: &egui::Response, depth: usize, path: &Path, into: bool, cx: &mut TreeCtx) {
+    resp.dnd_set_drag_payload(DragItem(path.to_path_buf()));
+    let Some(item) = resp.dnd_hover_payload::<DragItem>() else { return };
+    if item.0 == path || path.starts_with(&item.0) {
+        return;
+    }
+    let Some(pos) = ui.ctx().pointer_interact_pos() else { return };
+    let r = resp.rect;
+    let t = (pos.y - r.top()) / r.height().max(1.0);
+    let place = match (into, t) {
+        (true, t) if t < 0.25 => Place::Before,
+        (true, t) if t > 0.75 => Place::After,
+        (true, _) => Place::Into,
+        (false, t) if t < 0.5 => Place::Before,
+        (false, _) => Place::After,
+    };
+    let left = r.left() + 8.0 + depth as f32 * INDENT;
+    let stroke = Stroke::new(2.0, cx.pal.accent);
+    let p = ui.painter();
+    match place {
+        Place::Into => {
+            // 畫在文字上面，所以只用很淡的底色
+            p.rect_filled(r, 6.0, cx.pal.accent.gamma_multiply(0.10));
+            p.rect_stroke(r.shrink(1.0), 6.0, stroke, egui::StrokeKind::Inside);
+        }
+        Place::Before | Place::After => {
+            let y = if place == Place::Before { r.top() } else { r.bottom() };
+            p.hline(left..=r.right() - 4.0, y, stroke);
+            p.circle_stroke(pos2(left, y), 3.0, stroke);
+        }
+    }
+    if resp.dnd_release_payload::<DragItem>().is_some() {
+        cx.actions.push(Action::Drop { src: item.0.clone(), target: path.to_path_buf(), place });
+    }
+}
+
 /// 縮排導引線：從 `top` 畫到 `bottom`，位置對齊上層的展開箭頭。
 fn guide(ui: &Ui, left: f32, depth: usize, top: f32, bottom: f32, pal: &Palette) {
     if bottom - top < 2.0 {
@@ -159,13 +211,17 @@ pub fn entries(ui: &mut Ui, list: &[Entry], depth: usize, cx: &mut TreeCtx) {
                     selected: false,
                     on_path,
                     hover: Some(&hover),
+                    draggable: true,
                 };
                 let resp = row(ui, spec, &cx.pal);
+                dnd(ui, &resp, depth, &e.path, true, cx);
                 if resp.clicked() {
                     toggle(cx.expanded, &e.path);
                 }
                 resp.context_menu(|ui| {
                     new_menu(ui, &e.path, cx.actions);
+                    ui.separator();
+                    novel_item(ui, &e.path, cx.actions);
                     ui.separator();
                     common_menu(ui, &e.path, cx.actions);
                 });
@@ -194,12 +250,16 @@ pub fn entries(ui: &mut Ui, list: &[Entry], depth: usize, cx: &mut TreeCtx) {
                     selected: false,
                     on_path,
                     hover: Some(&hover),
+                    draggable: true,
                 };
                 let resp = row(ui, spec, &cx.pal);
+                dnd(ui, &resp, depth, &e.path, true, cx);
                 if resp.clicked() {
                     toggle(cx.expanded, &e.path);
                 }
                 resp.context_menu(|ui| {
+                    novel_item(ui, &e.path, cx.actions);
+                    ui.separator();
                     book_menu(ui, book, cx.actions);
                     ui.separator();
                     common_menu(ui, &e.path, cx.actions);
@@ -226,6 +286,7 @@ fn empty_row(ui: &mut Ui, depth: usize, text: &str, pal: &Palette) {
         selected: false,
         on_path: false,
         hover: None,
+        draggable: false,
     };
     row(ui, spec, pal);
 }
@@ -245,8 +306,10 @@ pub fn book_contents(ui: &mut Ui, book: &Book, entry: &Entry, depth: usize, cx: 
             selected,
             on_path: false,
             hover: Some(&ch.rel),
+            draggable: true,
         };
         let resp = row(ui, spec, &cx.pal);
+        dnd(ui, &resp, depth, &ch.path, false, cx);
         if resp.clicked() && !selected {
             cx.actions.push(Action::Open(ch.path.clone()));
         }
@@ -285,6 +348,7 @@ pub fn book_contents(ui: &mut Ui, book: &Book, entry: &Entry, depth: usize, cx: 
         selected: false,
         on_path: false,
         hover: None,
+        draggable: false,
     };
     if row(ui, spec, &cx.pal).clicked() {
         cx.actions.push(Action::Dialog(Dialog::NewChapter { book: book.root.clone(), title: String::new() }));
@@ -321,8 +385,10 @@ pub fn file_labeled(ui: &mut Ui, path: &Path, name: &str, is_pdf: bool, depth: u
         selected,
         on_path: false,
         hover: Some(&hover),
+        draggable: true,
     };
     let resp = row(ui, spec, &cx.pal);
+    dnd(ui, &resp, depth, path, false, cx);
     if resp.clicked() && !selected {
         cx.actions.push(Action::Open(path.to_path_buf()));
     }
@@ -356,6 +422,14 @@ pub fn new_menu(ui: &mut Ui, dir: &Path, actions: &mut Vec<Action>) {
             title: String::new(),
             author: String::new(),
         }));
+        ui.close();
+    }
+}
+
+/// 「以書本模式閱讀」：把資料夾當成一本書，一頁一頁翻。
+pub fn novel_item(ui: &mut Ui, dir: &Path, actions: &mut Vec<Action>) {
+    if ui.button("以書本模式閱讀").clicked() {
+        actions.push(Action::OpenNovel { root: dir.to_path_buf(), chapter: None });
         ui.close();
     }
 }
