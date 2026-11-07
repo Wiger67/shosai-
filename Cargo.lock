@@ -4493,6 +4493,7 @@ name = "shosai-core"
 version = "0.1.0"
 dependencies = [
  "emojis",
+ "memmap2",
  "mitex",
  "pulldown-cmark",
  "serde",

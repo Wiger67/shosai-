@@ -414,8 +414,9 @@ impl PdfView {
                 let origin = ui.min_rect().min;
                 ui.set_min_size(vec2(content_w, content_h));
 
-                let near = viewport.expand2(vec2(0.0, viewport.height()));
-                let far = viewport.expand2(vec2(0.0, viewport.height() * 4.0));
+                // 預先渲染上下各半個畫面；超出 1.5 個畫面的頁面釋放貼圖（每頁約 4MB）
+                let near = viewport.expand2(vec2(0.0, viewport.height() * 0.5));
+                let far = viewport.expand2(vec2(0.0, viewport.height() * 1.5));
                 // 目前頁：畫面上方三分之一處所在的頁
                 let probe = viewport.top() + viewport.height() * 0.33;
                 if let Some((i, _)) = placed.iter().find(|(_, r)| r.top() - PAGE_GAP <= probe && probe <= r.bottom()) {
@@ -502,8 +503,8 @@ impl PdfView {
                 }
                 let origin = ui.min_rect().min;
                 ui.set_min_size(vec2(THUMB_PANEL_W, y));
-                let near = viewport.expand2(vec2(0.0, viewport.height()));
-                let far = viewport.expand2(vec2(0.0, viewport.height() * 6.0));
+                let near = viewport.expand2(vec2(0.0, viewport.height() * 0.5));
+                let far = viewport.expand2(vec2(0.0, viewport.height() * 3.0));
 
                 for (i, top) in items.into_iter().enumerate() {
                     let (w, h) = self.pages[i];

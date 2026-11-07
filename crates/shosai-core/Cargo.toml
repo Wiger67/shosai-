@@ -6,7 +6,7 @@ license.workspace = true
 
 [features]
 default = ["pdf"]
-pdf = ["dep:typst", "dep:typst-pdf", "dep:typst-kit", "dep:typst-layout", "dep:typst-svg"]
+pdf = ["dep:typst", "dep:typst-pdf", "dep:typst-kit", "dep:typst-layout", "dep:typst-svg", "dep:memmap2"]
 # 把 Typst 內建字型（Libertinus、New Computer Modern、DejaVu Sans Mono，約 10MB）編進執行檔。
 # 未啟用時使用系統字型。
 bundled-fonts = ["pdf", "typst-kit/embedded-fonts"]
@@ -22,5 +22,6 @@ typst = { version = "0.15", optional = true }
 typst-pdf = { version = "0.15", optional = true }
 typst-layout = { version = "0.15", optional = true }
 typst-svg = { version = "0.15", optional = true }
+memmap2 = { version = "0.9", optional = true }
 typst-kit = { version = "0.15", optional = true, features = ["scan-fonts"] }
 ureq = { version = "3", optional = true }

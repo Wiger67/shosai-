@@ -241,6 +241,10 @@ cargo test --workspace --all-features   # 單元測試＋把範例書實際輸�
 
 - 閒置時不重畫：只有在輸入、捲動、檔案變動或背景工作完成時才重畫畫面，閒置 CPU／GPU 使用率為 0%
   （可用 `SHOSAI_FRAME_STATS=1 shosai` 檢查每秒重畫次數）
+- 記憶體：Markdown 中的點陣圖在背景解碼並縮到最多 1600px 寬（一張 4000×3000 相片從約 90MB 降到 7MB）；
+  數學式排版用到的系統字型以記憶體映射載入，不整個讀進記憶體；PDF 只保留畫面附近頁面的貼圖。
+  閒置時多數的記憶體是顯示卡（OpenGL）驅動本身的開銷
+- 效能分析：`cargo build --profile profiling` 會保留符號，可搭配 heaptrack / perf 使用
 
 - GUI 使用 egui（立即模式、OpenGL），不帶瀏覽器核心；中文字型由系統「需要時才載入」，不拖慢啟動
 - PDF 引擎只在輸出時才初始化；系統字型只掃描一次並快取

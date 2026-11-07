@@ -70,9 +70,28 @@ mod embedded {
             }
             #[cfg(feature = "bundled-fonts")]
             store.extend(typst_kit::fonts::embedded());
-            store.extend(typst_kit::fonts::system());
+            // 系統字型改用記憶體映射：中文字型檔動輒 20MB，整個讀進記憶體太浪費
+            store.extend(
+                typst_kit::fonts::system().map(|(p, info)| (MappedFont { path: p.path, index: p.index }, info)),
+            );
             store
         })
+    }
+
+    /// 以記憶體映射（mmap）載入的字型：只有實際用到的部分會讀進記憶體，
+    /// 而且是可與其他程式共用的檔案頁面，不佔私有記憶體。
+    struct MappedFont {
+        path: PathBuf,
+        index: u32,
+    }
+
+    impl typst_kit::fonts::FontSource for MappedFont {
+        fn load(&self) -> Option<Font> {
+            let file = std::fs::File::open(&self.path).ok()?;
+            // SAFETY: 字型檔在程式執行期間被改寫的機率極低；萬一發生，最壞是該字型顯示錯誤。
+            let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+            Font::new(Bytes::new(map), self.index)
+        }
     }
 
     fn library() -> &'static LazyHash<Library> {
@@ -168,8 +187,8 @@ mod embedded {
         let result = typst::compile::<PagedDocument>(&world);
         let document = result.output.map_err(|errs| Error::Export(format_errors(&world, &errs)))?;
         let page = document.pages().first().ok_or_else(|| Error::Export("沒有內容".into()))?;
-        // 保留快取一段時間：同一份文件的數學式會反覆渲染
-        typst::comemo::evict(60);
+        // 只保留最近幾次編譯的快取：足以加速同一份文件的數學式，又不會無限累積
+        typst::comemo::evict(10);
         Ok(typst_svg::svg(page, &typst_svg::SvgOptions::default()))
     }
 

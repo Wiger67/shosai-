@@ -17,3 +17,10 @@ strip = true
 # 依賴套件以「體積」優先最佳化（對啟動速度幾乎沒影響），自己的程式碼仍用 opt-level 3
 [profile.release.package."*"]
 opt-level = "s"
+
+# 效能分析用（cargo build --profile profiling）：保留符號以便 heaptrack / perf 追蹤
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = 1
+lto = "thin"

@@ -1879,7 +1879,19 @@ impl eframe::App for ShosaiApp {
         if let Some((since, frames)) = self.frame_stats.as_mut() {
             *frames += 1;
             if since.elapsed() >= Duration::from_secs(1) {
-                eprintln!("frames/s: {frames}");
+                let atlas = ctx.fonts(|f| f.font_image_size());
+                let (count, bytes) = ctx
+                    .tex_manager()
+                    .read()
+                    .allocated()
+                    .fold((0, 0), |(n, b), (_, m)| (n + 1, b + m.size[0] * m.size[1] * m.bytes_per_pixel));
+                eprintln!(
+                    "frames/s: {frames}  font atlas: {}x{} ({:.1} MB)  textures: {count} ({:.1} MB)",
+                    atlas[0],
+                    atlas[1],
+                    (atlas[0] * atlas[1] * 4) as f64 / 1048576.0,
+                    bytes as f64 / 1048576.0
+                );
                 *since = Instant::now();
                 *frames = 0;
             }
