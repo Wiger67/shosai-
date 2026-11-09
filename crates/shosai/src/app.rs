@@ -250,6 +250,8 @@ pub struct ShosaiApp {
     first_frame: bool,
     applied_theme: Option<Option<bool>>,
     applied_scale: f32,
+    /// Ctrl+滾輪累積的縮放量（對數），滿一格才調整一級字級
+    wheel_zoom: f32,
     show_settings: bool,
     settings_tab: SettingsTab,
     /// 拖動介面縮放拉條時的暫定值（放開才套用，避免縮放改變拉條位置造成失控）
@@ -397,6 +399,7 @@ impl ShosaiApp {
             first_frame: true,
             applied_theme: None,
             applied_scale: 0.0,
+            wheel_zoom: 0.0,
             show_settings: false,
             settings_tab: SettingsTab::Appearance,
             scale_draft: None,
@@ -1026,7 +1029,7 @@ impl ShosaiApp {
         if settings {
             self.show_settings = !self.show_settings;
         }
-        let (save, edit, split, read, book_mode, sidebar, new_note, zoom_in, zoom_out) = ctx.input_mut(|i| {
+        let (save, edit, split, read, book_mode, sidebar, new_note, mut zoom_in, mut zoom_out) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::S)),
                 i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::Num1)),
@@ -1065,6 +1068,23 @@ impl ShosaiApp {
         if new_note {
             if let Some(dir) = self.current_dir() {
                 self.dialog = Some(Dialog::NewNote { dir, name: String::new() });
+            }
+        }
+        // Ctrl+滾輪：文字頁面調整字級（PDF 由檢視器自己以游標為中心縮放）
+        if self.pdf.is_none() || self.novel.is_some() {
+            let delta = ctx.input(|i| i.zoom_delta());
+            if delta == 1.0 {
+                self.wheel_zoom = 0.0;
+            } else {
+                self.wheel_zoom += delta.ln();
+                const STEP: f32 = 0.18;
+                if self.wheel_zoom >= STEP {
+                    zoom_in = true;
+                    self.wheel_zoom = 0.0;
+                } else if self.wheel_zoom <= -STEP {
+                    zoom_out = true;
+                    self.wheel_zoom = 0.0;
+                }
             }
         }
         if zoom_in || zoom_out {
@@ -2150,7 +2170,7 @@ impl ShosaiApp {
                             ("← → 空白鍵", "書本模式翻頁（直排時 ← 是下一頁）"),
                             ("T / Esc", "書本模式：目錄 / 結束"),
                             ("Ctrl+B", "顯示 / 隱藏側欄"),
-                            ("Ctrl+= / Ctrl+-", "放大 / 縮小（PDF 為縮放）"),
+                            ("Ctrl+= / Ctrl+-、Ctrl+滾輪", "放大 / 縮小（PDF 為縮放）"),
                             ("← / →", "閱讀模式翻章；PDF 翻頁"),
                             ("Home / End", "PDF 第一頁 / 最後一頁"),
                             ("Ctrl+G", "PDF 輸入頁碼跳頁"),

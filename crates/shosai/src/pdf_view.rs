@@ -23,6 +23,16 @@ const MARGIN: f32 = 28.0;
 const MAX_PX: f32 = 4096.0;
 const THUMB_W: f32 = 112.0;
 const THUMB_PANEL_W: f32 = 150.0;
+const MIN_ZOOM: f32 = 0.2;
+const MAX_ZOOM: f32 = 6.0;
+
+/// 上一個畫面的版面，Ctrl+滾輪縮放時用來以游標為中心。
+struct ViewState {
+    /// 每頁在內容座標中的位置
+    placed: Vec<Rect>,
+    offset: egui::Vec2,
+    inner: Rect,
+}
 
 #[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Fit {
@@ -75,6 +85,7 @@ pub struct PdfView {
     page_input_focused: bool,
     focus_page_input: bool,
     thumb_follow: Option<usize>,
+    view: Option<ViewState>,
 }
 
 impl PdfView {
@@ -109,6 +120,7 @@ impl PdfView {
             page_input_focused: false,
             focus_page_input: false,
             thumb_follow: None,
+            view: None,
         }
     }
 
@@ -125,7 +137,7 @@ impl PdfView {
     }
 
     pub fn zoom_by(&mut self, factor: f32) {
-        self.fit = Fit::Zoom((self.effective_zoom() * factor).clamp(0.2, 6.0));
+        self.fit = Fit::Zoom((self.effective_zoom() * factor).clamp(MIN_ZOOM, MAX_ZOOM));
     }
 
     pub fn go_to(&mut self, page: usize) {
@@ -365,125 +377,169 @@ impl PdfView {
         }
     }
 
+    /// 依縮放計算版面：每頁在內容座標中的位置與整體內容大小。
+    fn layout(&self, avail: egui::Vec2, zoom: f32) -> (Vec<Rect>, egui::Vec2) {
+        let pages = &self.pages;
+        let mut placed = vec![Rect::NOTHING; pages.len()];
+        let content_w = avail.x.max(self.widest_row() * PT_TO_PX * zoom + 2.0 * MARGIN);
+        let mut y = MARGIN;
+        for row in self.rows() {
+            let rw =
+                row.iter().map(|&i| pages[i].0).sum::<f32>() * PT_TO_PX * zoom + PAGE_GAP * (row.len() as f32 - 1.0);
+            let rh = row.iter().map(|&i| pages[i].1).fold(0.0, f32::max) * PT_TO_PX * zoom;
+            let mut x = ((content_w - rw) / 2.0).max(MARGIN);
+            for &i in &row {
+                let size = vec2(pages[i].0, pages[i].1) * PT_TO_PX * zoom;
+                // 同一列中較矮的頁面垂直置中
+                let top = y + (rh - size.y) / 2.0;
+                placed[i] = Rect::from_min_size(pos2(x, top), size);
+                x += size.x + PAGE_GAP;
+            }
+            y += rh + PAGE_GAP;
+        }
+        (placed, vec2(content_w, y + MARGIN - PAGE_GAP))
+    }
+
+    /// 最寬一列的寬度（pt，含頁間距）。
+    fn widest_row(&self) -> f32 {
+        self.rows()
+            .iter()
+            .map(|row| {
+                row.iter().map(|&i| self.pages[i].0).sum::<f32>() + PAGE_GAP / PT_TO_PX * (row.len() as f32 - 1.0)
+            })
+            .fold(1.0, f32::max)
+    }
+
     fn pages_view(&mut self, ui: &mut egui::Ui) {
         let ppp = ui.ctx().pixels_per_point();
         let avail = ui.available_size();
-        let rows = self.rows();
-        let pages = self.pages.clone();
-        let sizes: Vec<(f32, f32)> = rows
-            .iter()
-            .map(|row| {
-                let w = row.iter().map(|&i| pages[i].0).sum::<f32>() + PAGE_GAP / PT_TO_PX * (row.len() as f32 - 1.0);
-                let h = row.iter().map(|&i| pages[i].1).fold(0.0, f32::max);
-                (w, h)
-            })
-            .collect();
-        let widest = sizes.iter().map(|s| s.0).fold(1.0, f32::max);
-        let tallest = sizes.iter().map(|s| s.1).fold(1.0, f32::max);
+        let widest = self.widest_row();
+        let tallest = self.pages.iter().map(|p| p.1).fold(1.0, f32::max);
         // 符合寬度時不超過舒適的閱讀寬度（雙頁時加倍）
         let max_w = if self.spread { 1700.0 } else { 860.0 };
         let fit_w = (avail.x - 2.0 * MARGIN).clamp(120.0, max_w) / (widest * PT_TO_PX);
         let fit_h = (avail.y - 2.0 * MARGIN).max(120.0) / (tallest * PT_TO_PX);
-        let zoom = match self.fit {
+        let old_zoom = match self.fit {
             Fit::Width => fit_w,
             Fit::Page => fit_w.min(fit_h),
             Fit::Zoom(z) => z,
         };
+
+        // Ctrl+滾輪（或觸控板雙指縮放）：以游標所在位置為中心縮放
+        let mut anchor = None;
+        if let Some(view) = &self.view {
+            let (delta, pointer) = ui.input(|i| (i.zoom_delta(), i.pointer.hover_pos()));
+            if let Some(p) = pointer.filter(|p| delta != 1.0 && view.inner.contains(*p)) {
+                let zoom = (old_zoom * delta).clamp(MIN_ZOOM, MAX_ZOOM);
+                if zoom != old_zoom {
+                    self.fit = Fit::Zoom(zoom);
+                    let local = p - view.inner.min;
+                    let c = (local + view.offset).to_pos2();
+                    // 游標所在（或最接近）的頁面，記下游標在頁面中的相對位置
+                    let dist = |r: &Rect| (r.top() - c.y).max(c.y - r.bottom()).max(0.0);
+                    let nearest = view.placed.iter().enumerate().min_by(|a, b| dist(a.1).total_cmp(&dist(b.1)));
+                    if let Some((i, r)) = nearest {
+                        anchor = Some((i, (c - r.min) / r.size(), local));
+                    }
+                }
+            }
+        }
+        let zoom = match self.fit {
+            Fit::Zoom(z) => z,
+            _ => old_zoom,
+        };
         self.last_zoom = zoom;
+        let (placed, content) = self.layout(avail, zoom);
 
-        egui::ScrollArea::both().id_salt(("pdf", &self.path)).auto_shrink([false, false]).show_viewport(
-            ui,
-            |ui, viewport| {
-                // 版面：每頁在內容座標中的位置
-                let mut placed: Vec<(usize, Rect)> = Vec::with_capacity(self.pages.len());
-                let mut y = MARGIN;
-                let content_w = avail.x.max(widest * PT_TO_PX * zoom + 2.0 * MARGIN);
-                for (row, &(rw, rh)) in rows.iter().zip(&sizes) {
-                    let row_w = rw * PT_TO_PX * zoom;
-                    let mut x = ((content_w - row_w) / 2.0).max(MARGIN);
-                    for &i in row {
-                        let size = vec2(pages[i].0, pages[i].1) * PT_TO_PX * zoom;
-                        // 同一列中較矮的頁面垂直置中
-                        let top = y + (rh * PT_TO_PX * zoom - size.y) / 2.0;
-                        placed.push((i, Rect::from_min_size(pos2(x, top), size)));
-                        x += size.x + PAGE_GAP;
-                    }
-                    y += rh * PT_TO_PX * zoom + PAGE_GAP;
+        let mut area = egui::ScrollArea::both().id_salt(("pdf", &self.path)).auto_shrink([false, false]);
+        if let Some((i, uv, local)) = anchor {
+            let r = placed[i];
+            let c = r.min + uv * r.size();
+            area = area.scroll_offset((c - local).to_vec2().max(egui::Vec2::ZERO));
+        }
+        let out = area.show_viewport(ui, |ui, viewport| {
+            let origin = ui.min_rect().min;
+            ui.set_min_size(content);
+
+            // 預先渲染上下各半個畫面；超出 1.5 個畫面的頁面釋放貼圖（每頁約 4MB）
+            let near = viewport.expand2(vec2(0.0, viewport.height() * 0.5));
+            let far = viewport.expand2(vec2(0.0, viewport.height() * 1.5));
+            // 目前頁：畫面上方三分之一處所在的頁
+            let probe = viewport.top() + viewport.height() * 0.33;
+            if let Some(i) = placed.iter().position(|r| r.top() - PAGE_GAP <= probe && probe <= r.bottom()) {
+                if self.current != i && self.jump_to.is_none() {
+                    self.thumb_follow = Some(i);
                 }
-                let content_h = y + MARGIN - PAGE_GAP;
-                let origin = ui.min_rect().min;
-                ui.set_min_size(vec2(content_w, content_h));
+                self.current = i;
+            }
+            let shadow = Color32::from_black_alpha(if ui.visuals().dark_mode { 90 } else { 30 });
+            // 對齊實體像素：貼圖一個像素對一個螢幕像素，才不會被線性取樣糊掉
+            let snap = |p: egui::Pos2| pos2((p.x * ppp).round() / ppp, (p.y * ppp).round() / ppp);
 
-                // 預先渲染上下各半個畫面；超出 1.5 個畫面的頁面釋放貼圖（每頁約 4MB）
-                let near = viewport.expand2(vec2(0.0, viewport.height() * 0.5));
-                let far = viewport.expand2(vec2(0.0, viewport.height() * 1.5));
-                // 目前頁：畫面上方三分之一處所在的頁
-                let probe = viewport.top() + viewport.height() * 0.33;
-                if let Some((i, _)) = placed.iter().find(|(_, r)| r.top() - PAGE_GAP <= probe && probe <= r.bottom()) {
-                    if self.current != *i && self.jump_to.is_none() {
-                        self.thumb_follow = Some(*i);
-                    }
-                    self.current = *i;
+            for (i, &local) in placed.iter().enumerate() {
+                if self.jump_to == Some(i) {
+                    let target = local.translate(origin.to_vec2()).translate(vec2(0.0, -MARGIN / 2.0));
+                    ui.scroll_to_rect(target, Some(Align::TOP));
+                    self.jump_to = None;
+                    self.current = i;
                 }
-                let shadow = Color32::from_black_alpha(if ui.visuals().dark_mode { 90 } else { 30 });
+                if !local.intersects(far) {
+                    self.textures.remove(&i);
+                    continue;
+                }
+                if !local.intersects(near) {
+                    continue;
+                }
+                let rect = local.translate(origin.to_vec2());
+                let painter = ui.painter();
+                painter.rect_filled(rect.translate(vec2(0.0, 3.0)).expand(2.0), 3.0, shadow);
+                painter.rect_filled(rect, 0.0, Color32::WHITE);
 
-                for (i, local) in placed {
-                    if self.jump_to == Some(i) {
-                        let target = local.translate(origin.to_vec2()).translate(vec2(0.0, -MARGIN / 2.0));
-                        ui.scroll_to_rect(target, Some(Align::TOP));
-                        self.jump_to = None;
-                        self.current = i;
-                    }
-                    if !local.intersects(far) {
-                        self.textures.remove(&i);
-                        continue;
-                    }
-                    if !local.intersects(near) {
-                        continue;
-                    }
-                    let rect = local.translate(origin.to_vec2());
-                    let painter = ui.painter();
-                    painter.rect_filled(rect.translate(vec2(0.0, 3.0)).expand(2.0), 3.0, shadow);
-                    painter.rect_filled(rect, 0.0, Color32::WHITE);
-
-                    let wanted = (rect.width() * ppp).min(MAX_PX).round() as u32;
-                    match self.textures.get(&i) {
-                        Some((px, tex)) => {
-                            painter.image(
-                                tex.id(),
-                                rect,
-                                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                                Color32::WHITE,
-                            );
-                            // 縮放差太多時用新的解析度重新渲染（舊的先繼續顯示）
-                            let ratio = wanted as f32 / *px as f32;
-                            if !(0.85..=1.15).contains(&ratio) && !self.failed.contains(&i) {
-                                self.request(i, wanted, false);
-                            }
-                        }
-                        None if self.failed.contains(&i) => {
-                            painter.text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "這一頁無法顯示",
-                                egui::FontId::proportional(14.0),
-                                Color32::GRAY,
-                            );
-                        }
-                        None => {
+                let exact = (rect.width() * ppp).round().max(1.0);
+                let wanted = exact.min(MAX_PX) as u32;
+                match self.textures.get(&i) {
+                    Some((px, tex)) => {
+                        // 解析度剛好符合畫面時，以貼圖原尺寸畫在像素格上（超過上限時只能拉伸）
+                        let draw = if *px as f32 == exact {
+                            let [w, h] = tex.size();
+                            Rect::from_min_size(snap(rect.min), vec2(w as f32, h as f32) / ppp)
+                        } else {
+                            rect
+                        };
+                        painter.image(
+                            tex.id(),
+                            draw,
+                            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                        // 解析度與畫面不符就重新渲染（舊的先繼續顯示）
+                        if *px != wanted && !self.failed.contains(&i) {
                             self.request(i, wanted, false);
-                            painter.text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                format!("{}", i + 1),
-                                egui::FontId::proportional(18.0),
-                                Color32::from_gray(190),
-                            );
                         }
                     }
+                    None if self.failed.contains(&i) => {
+                        painter.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "這一頁無法顯示",
+                            egui::FontId::proportional(14.0),
+                            Color32::GRAY,
+                        );
+                    }
+                    None => {
+                        self.request(i, wanted, false);
+                        painter.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            format!("{}", i + 1),
+                            egui::FontId::proportional(18.0),
+                            Color32::from_gray(190),
+                        );
+                    }
                 }
-            },
-        );
+            }
+        });
+        self.view = Some(ViewState { placed, offset: out.state.clamped_offset(), inner: out.inner_rect });
     }
 
     fn thumbnails(&mut self, ui: &mut egui::Ui, pal: &Palette) {
@@ -611,13 +667,17 @@ fn worker(path: &Path, rx: Receiver<Request>, tx: Sender<Response>, ctx: egui::C
 
         for req in queue {
             let Some(page) = pages.get(req.page) else { continue };
-            let (w, _) = page.render_dimensions();
+            let (w, h) = page.render_dimensions();
             let scale = req.px_width as f32 / w.max(1.0);
+            // 明確指定像素大小：只給比例的話 hayro 會無條件捨去，常少一個像素而被拉伸變糊
+            let px_w = req.px_width.min(u16::MAX as u32) as u16;
+            let px_h = (h * scale).round().clamp(1.0, u16::MAX as f32) as u16;
             let rs = RenderSettings {
                 x_scale: scale,
                 y_scale: scale,
+                width: Some(px_w),
+                height: Some(px_h),
                 bg_color: hayro::vello_cpu::color::palette::css::WHITE,
-                ..Default::default()
             };
             // hayro 仍在開發中，個別頁面若出錯不要拖垮整個程式
             let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
