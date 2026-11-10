@@ -12,10 +12,12 @@ use shosai_core::library::{CustomOrder, SortKey, SortOptions};
 use shosai_core::novel::NovelBook;
 use shosai_core::{library, markdown, Book, Entry, EntryKind, Library};
 
+use crate::find::FindState;
 use crate::icons::{self, Icon};
-use crate::md_view::{MdView, ViewEvent};
-use crate::novel_view::{NovelEvent, NovelPrefs, NovelView};
+use crate::md_view::{MdView, ViewEvent, PROBE_BELOW_TOP};
+use crate::novel_view::{toc_row, NovelEvent, NovelPrefs, NovelView, TocRow};
 use crate::pdf_view::{Fit, PdfView};
+use crate::scroll_map;
 use crate::theme::{self, Palette};
 use crate::tree::{self, DragItem, Place, TreeCtx, TreeNav};
 
@@ -69,6 +71,10 @@ struct Settings {
     /// 停止輸入幾秒後自動儲存
     autosave_secs: f32,
     show_word_count: bool,
+    /// 顯示文件大綱
+    outline: bool,
+    /// 分割模式：編輯區和預覽一起捲動
+    sync_scroll: bool,
     /// 側欄
     show_pdfs: bool,
     show_counts: bool,
@@ -104,6 +110,8 @@ impl Default for Settings {
             editor_proportional: false,
             autosave_secs: 1.2,
             show_word_count: true,
+            outline: false,
+            sync_scroll: true,
             show_pdfs: true,
             show_counts: true,
             pdf_fit: Fit::Width,
@@ -127,6 +135,69 @@ struct OpenDoc {
     saved_hash: u64,
     words: usize,
     words_stale: bool,
+    /// 文字的版本號：每次修改都換一個新的（尋找結果等快取用它判斷要不要重算）
+    rev: u64,
+}
+
+/// 產生一個沒用過的版本號（跨檔案也不會重複）。
+fn next_rev() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl OpenDoc {
+    /// 文字被改過了：標記未儲存、字數待重算、換版本號。
+    fn edited(&mut self) {
+        self.dirty = true;
+        self.words_stale = true;
+        self.last_edit = Instant::now();
+        self.rev = next_rev();
+    }
+}
+
+/// 這一幀要讓編輯區捲到哪裡。
+enum EditorGoto {
+    /// 把原始文字的第幾個字（可帶小數）對齊到最上緣：跟著預覽捲、切換模式時保持位置
+    Sync(f32),
+    /// 跳到標題：捲到最上面，游標也放過去
+    Heading(usize),
+    /// 尋找結果：看不到才捲，並選取起來
+    Match(std::ops::Range<usize>),
+}
+
+/// 編輯區目前顯示到哪裡（以原始文字的字元位置表示）。
+#[derive(Default, Clone, Copy)]
+struct EditorView {
+    /// 最上緣是第幾個字
+    top: f32,
+    /// 最上緣往下一點的位置，判斷「目前在哪個標題」用
+    probe: f32,
+}
+
+/// 分割模式捲動同步的狀態。
+#[derive(Default)]
+struct SplitSync {
+    /// 上一幀編輯區、預覽各自顯示到原始文字的第幾個字
+    seen: (f32, f32),
+    /// 在這個時間之前由預覽主導（剛在預覽上捲動或點擊）；其餘時候由編輯區主導
+    preview_until: f64,
+    /// 這一幀有沒有滾輪捲動。要在畫面開始畫之前先記下來：捲動區用掉捲動量之後就讀不到了
+    wheel: bool,
+    /// 編輯區這一幀排好的版面，用來算「某個字在多高」
+    editor: Option<EditorLayout>,
+    /// 預覽這一幀的捲動位置
+    preview_offset: f32,
+    /// 下一幀要把編輯區、預覽直接設到的捲動位置
+    editor_scroll_to: Option<f32>,
+    preview_scroll_to: Option<f32>,
+}
+
+struct EditorLayout {
+    galley: std::sync::Arc<egui::Galley>,
+    /// 畫面最上緣在文字裡的高度
+    top_y: f32,
+    /// 捲動位置
+    offset: f32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -275,6 +346,17 @@ pub struct ShosaiApp {
     focus_filter: bool,
     /// 開啟另一個檔案後要捲到的標題（`其他檔.md#標題` 這種連結）
     pending_anchor: Option<String>,
+    /// 文件內尋找（Ctrl+F）
+    find: FindState,
+    editor_goto: Option<EditorGoto>,
+    editor_view: EditorView,
+    sync: SplitSync,
+    /// 分割模式中預覽那一半的範圍
+    preview_rect: Option<egui::Rect>,
+    /// 上一幀顯示的是哪個模式（切換模式時保持閱讀位置）
+    shown_view: Option<ViewMode>,
+    /// 大綱中上一幀標示的是哪個標題
+    outline_current: Option<usize>,
 }
 
 /// 檔案監看：背景執行緒收到變動後記下時間，畫面在停止變動一小段時間後才重新整理
@@ -413,6 +495,13 @@ impl ShosaiApp {
             novel_titles: Default::default(),
             focus_filter: false,
             pending_anchor: None,
+            find: FindState::default(),
+            editor_goto: None,
+            editor_view: EditorView::default(),
+            sync: SplitSync::default(),
+            preview_rect: None,
+            shown_view: None,
+            outline_current: None,
             show_settings: false,
             settings_tab: SettingsTab::Appearance,
             scale_draft: None,
@@ -735,9 +824,12 @@ impl ShosaiApp {
                     saved_hash,
                     words,
                     words_stale: false,
+                    rev: next_rev(),
                 });
                 self.settings.last_file = Some(path.to_path_buf());
                 self.md_view = MdView::default();
+                self.editor_goto = None;
+                self.sync = SplitSync::default();
                 if let Some(a) = anchor {
                     self.md_view.scroll_to(&a);
                 }
@@ -980,9 +1072,7 @@ impl ShosaiApp {
                         _ => continue,
                     };
                     doc.text.replace_range(offset..offset + 3, replacement);
-                    doc.dirty = true;
-                    doc.words_stale = true;
-                    doc.last_edit = Instant::now();
+                    doc.edited();
                 }
                 ViewEvent::OpenLink(url) => {
                     if url.starts_with('#') {
@@ -1077,6 +1167,32 @@ impl ShosaiApp {
         if find_file {
             self.settings.sidebar = true;
             self.focus_filter = true;
+        }
+        // 文件內尋找、大綱（只在看 Markdown 文件時）
+        if self.doc.is_some() && self.novel.is_none() {
+            let (find, replace, outline, next, shift) = ctx.input_mut(|i| {
+                (
+                    i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::F)),
+                    i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::H)),
+                    i.consume_shortcut(&KeyboardShortcut::new(cmd | Modifiers::SHIFT, Key::O)),
+                    i.consume_key(Modifiers::NONE, Key::F3),
+                    i.modifiers.shift,
+                )
+            });
+            if find || replace {
+                self.open_find(ctx, replace);
+            }
+            if outline {
+                self.settings.outline = !self.settings.outline;
+            }
+            if next && self.find.active() {
+                let count = self.find_count();
+                self.find.step(!shift, count);
+            }
+            let modal = self.dialog.is_some() || self.show_settings;
+            if self.find.open && !modal && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.close_find(ctx);
+            }
         }
         // 正在編輯器裡打字時，Ctrl+B 是粗體（在 editor 裡處理），其他時候才是開關側欄
         let editing = self.doc.as_ref().is_some_and(|d| ctx.memory(|m| m.has_focus(editor_id(&d.path))));
@@ -1243,6 +1359,16 @@ impl ShosaiApp {
                     pdf.toolbar_right(ui, pal);
                 } else if self.doc.is_some() {
                     self.export_menu(ui);
+                    if icons::toggle(ui, Icon::List, "大綱（Ctrl+Shift+O）", self.settings.outline).clicked() {
+                        self.settings.outline = !self.settings.outline;
+                    }
+                    if icons::toggle(ui, Icon::Search, "尋找（Ctrl+F）", self.find.open).clicked() {
+                        if self.find.open {
+                            self.close_find(ui.ctx());
+                        } else {
+                            self.open_find(ui.ctx(), false);
+                        }
+                    }
                 }
             });
             self.handle_novel_events(novel_events);
@@ -1699,7 +1825,19 @@ impl ShosaiApp {
         let proportional = self.settings.editor_proportional;
         let Some(doc) = self.doc.as_mut() else { return };
         let id = editor_id(&doc.path);
-        egui::ScrollArea::vertical().id_salt(("editor", &doc.path)).auto_shrink([false, false]).show(ui, |ui| {
+        let find = &mut self.find;
+        let find_active = find.active();
+        if find_active {
+            find.update(&doc.text, doc.rev);
+        }
+        let mut goto = self.editor_goto.take();
+        let view = &mut self.editor_view;
+        let mut layout = None;
+        let mut area = egui::ScrollArea::vertical().id_salt(("editor", &doc.path)).auto_shrink([false, false]);
+        if let Some(offset) = self.sync.editor_scroll_to.take() {
+            area = area.vertical_scroll_offset(offset);
+        }
+        let scrolled = area.show(ui, |ui| {
             let full = ui.available_width();
             let width = if centered { full.min(800.0) } else { full };
             ui.add_space(if centered { 28.0 } else { 8.0 });
@@ -1725,39 +1863,380 @@ impl ShosaiApp {
                         formatted = format_selection(ui.ctx(), id, &mut doc.text, open, close);
                     }
                 }
-                let response = egui::Frame::new()
+                let out = egui::Frame::new()
                     .inner_margin(egui::Margin::symmetric(pad, 6))
                     .show(ui, |ui| {
-                        let edit = egui::TextEdit::multiline(&mut doc.text)
+                        egui::TextEdit::multiline(&mut doc.text)
                             .id(id)
                             .font(if proportional { FontId::proportional(size) } else { FontId::monospace(size) })
                             .desired_width(width - 2.0 * pad as f32)
                             .desired_rows(30)
                             .lock_focus(true)
                             .frame(egui::Frame::NONE)
-                            .hint_text("# 標題\n\n開始寫作……");
-                        ui.add(edit)
+                            .hint_text("# 標題\n\n開始寫作……")
+                            .show(ui)
                     })
                     .inner;
-                if response.changed() || formatted {
-                    doc.dirty = true;
-                    doc.words_stale = true;
-                    doc.last_edit = Instant::now();
+                if out.response.response.changed() || formatted {
+                    doc.edited();
+                }
+
+                // 排好版的文字：知道每個字畫在哪裡，才能對位、標示、跳轉
+                let galley = &out.galley;
+                let origin = out.galley_pos;
+                let clip = ui.clip_rect();
+                let top_y = clip.top() - origin.y;
+                view.top = scroll_map::galley_char_at(galley, top_y);
+                view.probe = scroll_map::galley_char_at(galley, top_y + PROBE_BELOW_TOP);
+                layout = Some((galley.clone(), top_y));
+
+                if find_active {
+                    if find.restart {
+                        find.start_from(view.top.max(0.0) as usize);
+                    }
+                    // 只標示畫面上看得到的那幾個
+                    let lo = view.top.max(0.0) as usize;
+                    let hi = scroll_map::galley_char_at(galley, clip.bottom() - origin.y).max(0.0) as usize + 1;
+                    let first = find.matches.partition_point(|m| m.chars.end <= lo);
+                    for (i, m) in find.matches.iter().enumerate().skip(first).take_while(|(_, m)| m.chars.start < hi) {
+                        let color = if i == find.current {
+                            Color32::from_rgba_unmultiplied(255, 150, 50, 130)
+                        } else {
+                            Color32::from_rgba_unmultiplied(255, 213, 79, 100)
+                        };
+                        for r in match_rects(galley, &m.chars) {
+                            ui.painter().rect_filled(r.translate(origin.to_vec2()), 2.0, color);
+                        }
+                    }
+                    if std::mem::take(&mut find.jump) {
+                        if let Some(m) = find.matches.get(find.current) {
+                            goto = Some(EditorGoto::Match(m.chars.clone()));
+                        }
+                    }
+                }
+
+                use egui::text::{CCursor, CCursorRange};
+                match goto.take() {
+                    Some(EditorGoto::Sync(source)) => {
+                        let delta = scroll_map::galley_y_of(galley, source) - top_y;
+                        if delta.abs() > 0.5 {
+                            // 正值是把內容往下推，所以要往下捲時給負值
+                            let none = egui::style::ScrollAnimation::none();
+                            ui.scroll_with_delta_animation(egui::vec2(0.0, -delta), none);
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                    Some(EditorGoto::Heading(chars)) => {
+                        let y = origin.y + scroll_map::galley_y_of(galley, chars as f32);
+                        let rect = egui::Rect::from_min_size(egui::pos2(origin.x, y - 4.0), egui::vec2(1.0, size));
+                        ui.scroll_to_rect(rect, Some(egui::Align::TOP));
+                        let mut state = out.state.clone();
+                        state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(chars))));
+                        state.store(ui.ctx(), id);
+                    }
+                    Some(EditorGoto::Match(range)) => {
+                        if let Some(r) = match_rects(galley, &range).first() {
+                            // 已經看得到就不動；上下多留一點，不要貼在邊緣
+                            let rect = r.translate(origin.to_vec2()).expand2(egui::vec2(0.0, 60.0));
+                            ui.scroll_to_rect(rect, None);
+                        }
+                        // 游標放過去（編輯區有焦點時才會保留成選取範圍，見 close_find）
+                        let mut state = out.state.clone();
+                        let range = CCursorRange::two(CCursor::new(range.start), CCursor::new(range.end));
+                        state.cursor.set_char_range(Some(range));
+                        state.store(ui.ctx(), id);
+                    }
+                    None => {}
                 }
             });
         });
+        let offset = scrolled.state.clamped_offset().y;
+        self.sync.editor = layout.map(|(galley, top_y)| EditorLayout { galley, top_y, offset });
     }
 
     fn preview(&mut self, ui: &mut egui::Ui) {
         let Some(doc) = self.doc.as_ref() else { return };
         let base = doc.path.parent().map(Path::to_path_buf).unwrap_or_default();
+        // 尋找結果在預覽中也標示出來（跳到哪一個由編輯區決定，預覽跟著捲）
+        let find = self.find.active().then_some((self.find.query.as_str(), self.find.case_sensitive));
+        self.md_view.set_find(find, None, false);
         let md_view = &mut self.md_view;
         let events = &mut self.view_events;
-        egui::ScrollArea::vertical().id_salt(("preview", &doc.path)).auto_shrink([false, false]).show(ui, |ui| {
+        let mut area = egui::ScrollArea::vertical().id_salt(("preview", &doc.path)).auto_shrink([false, false]);
+        if let Some(offset) = self.sync.preview_scroll_to.take() {
+            area = area.vertical_scroll_offset(offset);
+        }
+        let scrolled = area.show(ui, |ui| {
             egui::Frame::new().inner_margin(egui::Margin { left: 24, right: 24, top: 16, bottom: 32 }).show(ui, |ui| {
                 events.extend(md_view.show(ui, &doc.text, &base));
             });
         });
+        self.sync.preview_offset = scrolled.state.clamped_offset().y;
+    }
+
+    /// 分割模式：讓編輯區和預覽顯示同一段原始文字。
+    ///
+    /// 誰主導：剛在預覽上捲動或點擊的短時間內由預覽主導，其餘時候（打字、捲動編輯區、
+    /// 從大綱跳轉）由編輯區主導。只有主導的那一邊位置變了，另一邊才跟上去。
+    ///
+    /// 跟上去的方式是算出另一邊「應該在的捲動位置」，下一幀直接設定。不用 egui 的
+    /// 「再捲多少」：那要隔兩幀才生效，連續同步時同一段距離會被算兩次，畫面就來回震盪。
+    fn sync_split(&mut self, ctx: &egui::Context) {
+        let (editor, preview) = (self.editor_view.top, self.md_view.view_top);
+        let (last_editor, last_preview) = std::mem::replace(&mut self.sync.seen, (editor, preview));
+        if !self.settings.sync_scroll {
+            return;
+        }
+        let wheel = self.sync.wheel;
+        let (now, scrolling, typing, pointer) = ctx.input(|i| {
+            (
+                i.time,
+                wheel || i.pointer.any_down() || i.pointer.any_released(),
+                i.events.iter().any(|e| matches!(e, egui::Event::Key { .. } | egui::Event::Text(_))),
+                i.pointer.hover_pos(),
+            )
+        });
+        let over_preview = pointer.is_some_and(|p| self.preview_rect.is_some_and(|r| r.contains(p)));
+        if typing {
+            self.sync.preview_until = 0.0;
+        }
+        if scrolling {
+            // 多留一小段時間：平滑捲動和點連結後的捲動動畫都還要跑幾幀
+            self.sync.preview_until = if over_preview { now + 0.6 } else { 0.0 };
+        }
+        const MOVED: f32 = 0.01;
+        if now < self.sync.preview_until {
+            if (preview - last_preview).abs() > MOVED {
+                if let Some(e) = &self.sync.editor {
+                    let delta = scroll_map::galley_y_of(&e.galley, preview) - e.top_y;
+                    if delta.abs() > 0.5 {
+                        self.sync.editor_scroll_to = Some((e.offset + delta).max(0.0));
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        } else if (editor - last_editor).abs() > MOVED {
+            let delta = self.md_view.scroll_delta_to(editor);
+            if delta.abs() > 0.5 {
+                self.sync.preview_scroll_to = Some((self.sync.preview_offset + delta).max(0.0));
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 尋找
+
+    fn find_count(&self) -> usize {
+        if self.settings.view == ViewMode::Read {
+            self.find.rendered
+        } else {
+            self.find.matches.len()
+        }
+    }
+
+    fn open_find(&mut self, ctx: &egui::Context, with_replace: bool) {
+        // 編輯區有選取文字的話，直接拿來找
+        if let Some(doc) = &self.doc {
+            if let Some(selected) = editor_selection(ctx, editor_id(&doc.path), &doc.text) {
+                self.find.query = selected;
+            }
+        }
+        self.find.open = true;
+        self.find.focus = true;
+        if with_replace {
+            self.find.with_replace = true;
+        }
+    }
+
+    fn close_find(&mut self, ctx: &egui::Context) {
+        self.find.open = false;
+        // 回到編輯區，並選取目前找到的那一個（接著打字就能直接改掉它）。
+        // 要等編輯區拿到焦點才選得起來：沒有焦點的輸入框，egui 每一幀都會把選取範圍收成游標
+        if self.settings.view != ViewMode::Read {
+            if let Some(doc) = &self.doc {
+                ctx.memory_mut(|m| m.request_focus(editor_id(&doc.path)));
+                if let Some(m) = self.find.matches.get(self.find.current).filter(|_| !self.find.query.is_empty()) {
+                    self.editor_goto = Some(EditorGoto::Match(m.chars.clone()));
+                }
+            }
+        }
+    }
+
+    fn find_bar(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        use egui::text::{CCursor, CCursorRange};
+        let reading = self.settings.view == ViewMode::Read;
+        let count = self.find_count();
+        let id = egui::Id::unique("shosai-find");
+        let (mut step, mut close, mut replace_one, mut replace_all) = (None, false, false, false);
+        let field_w = 230.0;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let (r, _) = ui.allocate_exact_size(egui::vec2(18.0, 24.0), egui::Sense::hover());
+            icons::paint(
+                ui.painter(),
+                egui::Rect::from_center_size(r.center(), egui::vec2(14.0, 14.0)),
+                Icon::Search,
+                pal.weak,
+            );
+            let resp = ui
+                .add(egui::TextEdit::singleline(&mut self.find.query).id(id).hint_text("尋找").desired_width(field_w));
+            if std::mem::take(&mut self.find.focus) {
+                resp.request_focus();
+                // 全選：直接打字就能換掉上次找的字
+                let mut state = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+                let end = self.find.query.chars().count();
+                state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(end))));
+                state.store(ui.ctx(), id);
+            }
+            // Enter 下一個、Shift+Enter 上一個（單行輸入框按 Enter 會失去焦點，要再拿回來）
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                step = Some(!ui.input(|i| i.modifiers.shift));
+                resp.request_focus();
+            }
+            let (label, color) = if self.find.query.is_empty() {
+                (String::new(), pal.weak)
+            } else if count == 0 {
+                ("沒有符合".to_string(), ui.visuals().error_fg_color)
+            } else {
+                (format!("{} / {}", self.find.current + 1, count), pal.weak)
+            };
+            ui.add_sized([70.0, 20.0], egui::Label::new(RichText::new(label).small().color(color)));
+            if icons::button_sized(ui, Icon::ChevronLeft, "上一個（Shift+Enter、Shift+F3）", 26.0).clicked() {
+                step = Some(false);
+            }
+            if icons::button_sized(ui, Icon::ChevronRight, "下一個（Enter、F3）", 26.0).clicked() {
+                step = Some(true);
+            }
+            ui.add_space(4.0);
+            let case = egui::Button::selectable(self.find.case_sensitive, "Aa").corner_radius(6);
+            if ui.add(case).on_hover_text("區分大小寫").clicked() {
+                self.find.case_sensitive = !self.find.case_sensitive;
+            }
+            if !reading {
+                let replace = egui::Button::selectable(self.find.with_replace, "取代").corner_radius(6);
+                if ui.add(replace).on_hover_text("取代（Ctrl+H）").clicked() {
+                    self.find.with_replace = !self.find.with_replace;
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icons::button_sized(ui, Icon::Close, "關閉（Esc）", 26.0).clicked() {
+                    close = true;
+                }
+            });
+        });
+        if self.find.with_replace && !reading {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.add_space(22.0);
+                let edit = egui::TextEdit::singleline(&mut self.find.replacement)
+                    .id(egui::Id::unique("shosai-replace"))
+                    .hint_text("取代為")
+                    .desired_width(field_w);
+                let resp = ui.add(edit);
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    replace_one = true;
+                    resp.request_focus();
+                }
+                ui.add_space(4.0);
+                if ui.add_enabled(count > 0, egui::Button::new("取代")).on_hover_text("取代目前這一個").clicked()
+                {
+                    replace_one = true;
+                }
+                if ui.add_enabled(count > 0, egui::Button::new("全部取代")).clicked() {
+                    replace_all = true;
+                }
+            });
+        }
+
+        if let Some(forward) = step {
+            self.find.step(forward, count);
+        }
+        let mut replaced = None;
+        if replace_one || replace_all {
+            if let Some(doc) = self.doc.as_mut() {
+                // 先確定符合的位置是照現在的文字算的，再動手改
+                self.find.update(&doc.text, doc.rev);
+                if replace_all {
+                    let n = self.find.replace_all(&mut doc.text);
+                    if n > 0 {
+                        doc.edited();
+                        replaced = Some(n);
+                    }
+                } else if self.find.replace_current(&mut doc.text) {
+                    doc.edited();
+                }
+            }
+        }
+        if let Some(n) = replaced {
+            self.info(format!("已取代 {n} 處"));
+        }
+        if close {
+            self.close_find(ui.ctx());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 大綱
+
+    fn outline_panel(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        let Some(doc) = self.doc.as_ref() else { return };
+        // 編輯模式不顯示預覽，所以這裡自己確保解析過（內容沒變就不會重做）
+        self.md_view.parse(&doc.text);
+        let view = self.settings.view;
+        // 現在讀到哪裡：閱讀模式看預覽，其餘看編輯區
+        let probe = if view == ViewMode::Read { self.md_view.probe } else { self.editor_view.probe };
+        let items = self.md_view.outline();
+        // 還沒捲過任何標題（文件最上面）時，算在第一個標題
+        let current = items.iter().rposition(|h| h.chars as f32 <= probe).or((!items.is_empty()).then_some(0));
+        let follow = current != self.outline_current;
+        let mut clicked = None;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("大綱").strong().color(pal.ink));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icons::button_sized(ui, Icon::Close, "隱藏大綱（Ctrl+Shift+O）", 24.0).clicked() {
+                    self.settings.outline = false;
+                }
+            });
+        });
+        ui.add_space(4.0);
+        if items.is_empty() {
+            ui.label(RichText::new("這份文件還沒有標題。\n以 # 開頭的行會出現在這裡。").small().color(pal.weak));
+        }
+        let top_level = items.iter().map(|h| h.level).min().unwrap_or(1);
+        egui::ScrollArea::vertical().id_salt("outline").auto_shrink([false, false]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            for (i, h) in items.iter().enumerate() {
+                let row = TocRow {
+                    text: if h.text.trim().is_empty() { "（沒有文字的標題）" } else { &h.text },
+                    selected: current == Some(i),
+                    indent: f32::from(h.level - top_level) * 12.0,
+                    strong: h.level == top_level,
+                    ..Default::default()
+                };
+                let r = toc_row(ui, pal, row);
+                // 讀到別的標題了：大綱跟著捲到看得到
+                if follow && current == Some(i) {
+                    r.scroll_to_me(None);
+                }
+                if r.clicked() {
+                    clicked = Some((h.id.clone(), h.chars));
+                }
+            }
+        });
+        self.outline_current = current;
+        if let Some((id, chars)) = clicked {
+            if view == ViewMode::Read {
+                self.md_view.scroll_to(&id);
+            } else {
+                self.editor_goto = Some(EditorGoto::Heading(chars));
+                // 分割模式：編輯區主導，預覽跟著捲過去；沒開同步的話兩邊各自跳
+                self.sync.preview_until = 0.0;
+                if view == ViewMode::Split && !self.settings.sync_scroll {
+                    self.md_view.scroll_to(&id);
+                }
+            }
+        }
     }
 
     fn reader(&mut self, ui: &mut egui::Ui, pal: &Palette) {
@@ -1789,6 +2268,11 @@ impl ShosaiApp {
                 }
             }
         }
+
+        // 尋找：標示符合的地方，並捲到目前這一個
+        let jump = std::mem::take(&mut self.find.jump);
+        let find = self.find.active().then_some((self.find.query.as_str(), self.find.case_sensitive));
+        self.md_view.set_find(find, Some(self.find.current), jump);
 
         let (desk, paper, ink, weak) = (pal.desk, pal.paper, pal.ink, pal.weak);
         let size = self.settings.reader_size;
@@ -1876,6 +2360,13 @@ impl ShosaiApp {
                 }
             });
         });
+        // 畫完才知道畫面上有幾個符合；條件剛變的話，下一幀捲到第一個
+        if self.find.active() {
+            self.find.update_rendered(self.md_view.find_count);
+            if self.find.jump {
+                ui.ctx().request_repaint();
+            }
+        }
     }
 
     fn welcome(&mut self, ui: &mut egui::Ui, pal: &Palette) {
@@ -2046,6 +2537,7 @@ impl ShosaiApp {
                     ui.selectable_value(&mut st.view, ViewMode::Read, "閱讀");
                 });
                 ui.checkbox(&mut st.show_word_count, "在狀態列顯示字數");
+                ui.checkbox(&mut st.sync_scroll, "分割模式：編輯區和預覽一起捲動");
             }
             SettingsTab::Reader => {
                 heading(ui, "字級");
@@ -2285,6 +2777,9 @@ impl ShosaiApp {
                             ("Ctrl+B、Ctrl+\\", "顯示 / 隱藏側欄"),
                             ("Ctrl+B / I / K", "編輯時：粗體 / 斜體 / 連結"),
                             ("Ctrl+P", "搜尋檔案（↓ 選擇、Enter 開啟）"),
+                            ("Ctrl+F / Ctrl+H", "在文件中尋找 / 取代（Enter 下一個、Esc 關閉）"),
+                            ("F3 / Shift+F3", "下一個 / 上一個符合的地方"),
+                            ("Ctrl+Shift+O", "顯示 / 隱藏大綱"),
                             ("Ctrl+= / Ctrl+-、Ctrl+滾輪", "放大 / 縮小（PDF 為縮放）"),
                             ("← / →", "閱讀模式翻章；PDF 翻頁"),
                             ("↑ ↓ 空白鍵", "閱讀模式、PDF 捲動（Shift+空白鍵往上）"),
@@ -2432,6 +2927,7 @@ impl ShosaiApp {
 impl eframe::App for ShosaiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.sync.wheel = ctx.input(|i| i.smooth_scroll_delta != egui::Vec2::ZERO);
         self.apply_theme(&ctx);
         self.shortcuts(&ctx);
         self.poll_export();
@@ -2464,6 +2960,33 @@ impl eframe::App for ShosaiApp {
             .show_collapsible(ui, &mut sidebar_open, |ui| self.sidebar(ui, &pal));
         self.settings.sidebar = sidebar_open;
 
+        // 文件工具：尋找列在內容上方，大綱在最右邊
+        let doc_view = self.doc.is_some() && self.novel.is_none();
+        if doc_view && self.find.open {
+            egui::Panel::top("find")
+                .show_separator_line(false)
+                .frame(egui::Frame::new().fill(pal.chrome).inner_margin(egui::Margin::symmetric(10, 5)))
+                .show(ui, |ui| self.find_bar(ui, &pal));
+        }
+        if doc_view && self.settings.outline {
+            egui::Panel::right("outline")
+                .show_separator_line(false)
+                .frame(egui::Frame::new().fill(pal.chrome).inner_margin(egui::Margin::symmetric(8, 6)))
+                .resizable(true)
+                .default_size(220.0)
+                .size_range(150.0..=420.0)
+                .show(ui, |ui| self.outline_panel(ui, &pal));
+        }
+        // 切換模式時留在同一段文字：閱讀 ↔ 編輯／分割 是不同的捲動區，要把位置帶過去
+        if doc_view && self.shown_view != Some(self.settings.view) {
+            match (self.shown_view, self.settings.view) {
+                (Some(ViewMode::Read), _) => self.editor_goto = Some(EditorGoto::Sync(self.md_view.view_top)),
+                (Some(_), ViewMode::Read) => self.md_view.sync_to(self.editor_view.top),
+                _ => {}
+            }
+            self.shown_view = Some(self.settings.view);
+        }
+
         let surface = egui::Frame::new().fill(pal.surface);
         if self.novel.is_some() {
             let mut events = Vec::new();
@@ -2495,14 +3018,16 @@ impl eframe::App for ShosaiApp {
                 }
                 ViewMode::Split => {
                     let half = ui.available_width() / 2.0;
-                    egui::Panel::right("preview")
+                    let panel = egui::Panel::right("preview")
                         .show_separator_line(false)
                         .frame(egui::Frame::new().fill(pal.paper))
                         .resizable(true)
                         .default_size(half)
                         .size_range(220.0..=f32::INFINITY)
                         .show(ui, |ui| self.preview(ui));
+                    self.preview_rect = Some(panel.response.rect);
                     egui::CentralPanel::no_frame().frame(surface).show(ui, |ui| self.editor(ui, false));
+                    self.sync_split(&ctx);
                 }
                 ViewMode::Read => {
                     egui::CentralPanel::no_frame().show(ui, |ui| self.reader(ui, &pal));
@@ -2674,6 +3199,36 @@ fn editor_id(path: &Path) -> egui::Id {
     egui::Id::unique(("shosai-editor", path))
 }
 
+/// 編輯區目前選取的文字（單行、不太長才算，給 Ctrl+F 當作要找的字）。
+fn editor_selection(ctx: &egui::Context, id: egui::Id, text: &str) -> Option<String> {
+    if !ctx.memory(|m| m.has_focus(id)) {
+        return None;
+    }
+    let range = egui::TextEdit::load_state(ctx, id)?.cursor.char_range()?;
+    let [a, b] = range.sorted_cursors().map(|c| c.index.0);
+    if a == b || b - a > 200 {
+        return None;
+    }
+    let selected: String = text.chars().skip(a).take(b - a).collect();
+    (!selected.contains('\n')).then_some(selected)
+}
+
+/// 第 `chars` 範圍的字在排版結果中佔的矩形（相對於文字最上緣）；跨列時每列一個。
+fn match_rects(galley: &egui::Galley, chars: &std::ops::Range<usize>) -> Vec<egui::Rect> {
+    let mut start = egui::text::CCursor::new(chars.start);
+    // 剛好在自動換行的地方時，算下一列的開頭而不是上一列的結尾
+    start.prefer_next_row = true;
+    let a = galley.pos_from_cursor(start);
+    let b = galley.pos_from_cursor(egui::text::CCursor::new(chars.end));
+    if (a.top() - b.top()).abs() < 1.0 {
+        return vec![egui::Rect::from_min_max(a.left_top(), b.right_bottom())];
+    }
+    vec![
+        egui::Rect::from_min_max(a.left_top(), egui::pos2(galley.rect.right(), a.bottom())),
+        egui::Rect::from_min_max(egui::pos2(galley.rect.left(), b.top()), b.right_bottom()),
+    ]
+}
+
 fn content_hash(bytes: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -2755,6 +3310,10 @@ fn open_path(path: &Path) {
     };
     let _ = cmd.spawn();
 }
+
+#[cfg(test)]
+#[path = "app_e2e.rs"]
+mod e2e;
 
 #[cfg(test)]
 mod tests {

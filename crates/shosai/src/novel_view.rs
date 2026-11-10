@@ -1046,20 +1046,20 @@ fn group_digits(n: usize) -> String {
     out
 }
 
-/// 側邊目錄的一列。
+/// 側邊目錄的一列（文件大綱也用同一種列）。
 #[derive(Default)]
-struct TocRow<'a> {
-    text: &'a str,
+pub(crate) struct TocRow<'a> {
+    pub text: &'a str,
     /// 右側的淡色資訊（字數）
-    trailing: Option<String>,
-    selected: bool,
-    indent: f32,
+    pub trailing: Option<String>,
+    pub selected: bool,
+    pub indent: f32,
     /// 卷的標題列：展開／收合的箭頭
-    chevron: Option<bool>,
-    strong: bool,
+    pub chevron: Option<bool>,
+    pub strong: bool,
 }
 
-fn toc_row(ui: &mut Ui, pal: &Palette, row: TocRow) -> egui::Response {
+pub(crate) fn toc_row(ui: &mut Ui, pal: &Palette, row: TocRow) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
     if !ui.is_rect_visible(rect) {
         return resp;

@@ -10,12 +10,14 @@
 
 mod app;
 mod cli;
+mod find;
 mod icons;
 mod images;
 mod keys;
 mod md_view;
 mod novel_view;
 mod pdf_view;
+mod scroll_map;
 mod theme;
 mod tree;
 

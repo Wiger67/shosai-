@@ -43,6 +43,11 @@ pub struct MdDoc {
     pub blocks: Vec<Block>,
     /// 依引用順序編號的註腳
     pub footnotes: Vec<Footnote>,
+    /// `blocks` 裡每個區塊在原始文字中的位置（位元組），與 `blocks` 一一對應、由小到大。
+    /// 預覽與編輯器的捲動同步靠它對位。
+    pub offsets: Vec<usize>,
+    /// 每個標題（以錨點 id 查）在原始文字中的位置（位元組）
+    pub heading_offsets: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -201,24 +206,29 @@ pub struct TocEntry {
     pub level: u8,
     pub text: String,
     pub id: String,
+    /// 在原始文字中的位置（位元組）
+    pub offset: usize,
 }
 
 impl MdDoc {
     /// 所有標題（含提示框內的），依出現順序。
     pub fn headings(&self) -> Vec<TocEntry> {
-        fn walk(blocks: &[Block], out: &mut Vec<TocEntry>) {
+        fn walk(blocks: &[Block], offsets: &HashMap<String, usize>, out: &mut Vec<TocEntry>) {
             for b in blocks {
                 match b {
-                    Block::Heading { level, content, id } => {
-                        out.push(TocEntry { level: *level, text: plain_text(content), id: id.clone() })
-                    }
-                    Block::Quote(bs) | Block::Container { blocks: bs, .. } => walk(bs, out),
+                    Block::Heading { level, content, id } => out.push(TocEntry {
+                        level: *level,
+                        text: plain_text(content),
+                        id: id.clone(),
+                        offset: offsets.get(id).copied().unwrap_or(0),
+                    }),
+                    Block::Quote(bs) | Block::Container { blocks: bs, .. } => walk(bs, offsets, out),
                     _ => {}
                 }
             }
         }
         let mut out = Vec::new();
-        walk(&self.blocks, &mut out);
+        walk(&self.blocks, &self.heading_offsets, &mut out);
         out
     }
 
@@ -483,6 +493,13 @@ struct P<'a> {
     footnote_defs: HashMap<String, Vec<Block>>,
     footnote_numbers: HashMap<String, usize>,
     slugs: HashMap<String, usize>,
+    /// 目前在第幾層的 `blocks`（1 = 文件最上層）
+    depth: usize,
+    /// 最上層每個區塊的原始位置
+    top_offsets: Vec<usize>,
+    /// 正在解析的區塊從哪裡開始（前處理後的位置）
+    block_start: usize,
+    heading_offsets: HashMap<String, usize>,
 }
 
 /// 解析 HackMD 風格的 Markdown。
@@ -496,8 +513,14 @@ pub fn parse(src: &str) -> MdDoc {
         footnote_defs: HashMap::new(),
         footnote_numbers: HashMap::new(),
         slugs: HashMap::new(),
+        depth: 0,
+        top_offsets: Vec::new(),
+        block_start: 0,
+        heading_offsets: HashMap::new(),
     };
     let blocks = p.blocks(None);
+    debug_assert_eq!(blocks.len(), p.top_offsets.len());
+    let offsets = std::mem::take(&mut p.top_offsets);
     let mut footnotes: Vec<Footnote> = p
         .footnote_numbers
         .iter()
@@ -508,28 +531,48 @@ pub fn parse(src: &str) -> MdDoc {
         })
         .collect();
     footnotes.sort_by_key(|f| f.number);
-    MdDoc { meta: p.meta, blocks: fold_containers(blocks), footnotes }
+    let (offsets, blocks) = fold_with_offsets(offsets.into_iter().zip(blocks).collect()).into_iter().unzip();
+    MdDoc { meta: p.meta, blocks, footnotes, offsets, heading_offsets: p.heading_offsets }
 }
 
 impl<'a> P<'a> {
     /// 讀取區塊直到遇到 `end`（會吃掉 end 事件）。
     fn blocks(&mut self, end: Option<fn(&TagEnd) -> bool>) -> Vec<Block> {
+        self.depth += 1;
+        let top = self.depth == 1;
         let mut out = Vec::new();
         let mut loose: Vec<Inline> = Vec::new(); // 緊湊清單中直接出現的行內內容
+        let mut loose_start = 0;
         while let Some((ev, range)) = self.events.next() {
             match ev {
                 Event::End(ref t) if end.is_some_and(|f| f(t)) => break,
                 Event::Start(tag) if is_block_tag(&tag) => {
                     if !loose.is_empty() {
                         out.push(Block::Paragraph(self.finish_inlines(std::mem::take(&mut loose))));
+                        if top {
+                            self.top_offsets.push(self.map.map(loose_start));
+                        }
                     }
+                    self.block_start = range.start;
                     if let Some(b) = self.block(tag) {
                         out.push(b);
+                        if top {
+                            self.top_offsets.push(self.map.map(range.start));
+                        }
                     }
                 }
-                Event::Rule => out.push(Block::Rule),
+                Event::Rule => {
+                    out.push(Block::Rule);
+                    if top {
+                        self.top_offsets.push(self.map.map(range.start));
+                    }
+                }
                 other => {
+                    let start = range.start;
                     if let Some(i) = self.inline(other, range) {
+                        if loose.is_empty() {
+                            loose_start = start;
+                        }
                         loose.push(i);
                     }
                 }
@@ -537,11 +580,16 @@ impl<'a> P<'a> {
         }
         if !loose.is_empty() {
             out.push(Block::Paragraph(self.finish_inlines(loose)));
+            if top {
+                self.top_offsets.push(self.map.map(loose_start));
+            }
         }
+        self.depth -= 1;
         out
     }
 
     fn block(&mut self, tag: Tag<'a>) -> Option<Block> {
+        let start = self.block_start;
         Some(match tag {
             Tag::Paragraph => {
                 let inl = self.inlines(|t| matches!(t, TagEnd::Paragraph));
@@ -562,6 +610,7 @@ impl<'a> P<'a> {
                 let n = self.slugs.entry(base.clone()).or_insert(0);
                 let id = if *n == 0 { base.clone() } else { format!("{base}-{n}") };
                 *n += 1;
+                self.heading_offsets.insert(id.clone(), self.map.map(start));
                 Block::Heading { level: level_num(level), content, id }
             }
             Tag::BlockQuote(kind) => {
@@ -1028,12 +1077,28 @@ fn replace_emoji(text: &str) -> String {
 
 /// 把 `:::` 標記組成巢狀的提示框。
 fn fold_containers(blocks: Vec<Block>) -> Vec<Block> {
-    if !blocks.iter().any(|b| matches!(b, Block::Html(h) if h.trim_start().starts_with("<!--shosai:"))) {
+    fold_with_offsets(blocks.into_iter().map(|b| (0, b)).collect()).into_iter().map(|(_, b)| b).collect()
+}
+
+/// 把 `:::` 提示框的開頭／結尾記號之間的區塊收進一個 `Container`。
+/// 每個區塊帶著它在原始文字中的位置；提示框的位置是開頭記號的位置。
+fn fold_with_offsets(blocks: Vec<(usize, Block)>) -> Vec<(usize, Block)> {
+    if !blocks.iter().any(|(_, b)| matches!(b, Block::Html(h) if h.trim_start().starts_with("<!--shosai:"))) {
         return blocks;
     }
-    let mut stack: Vec<(ContainerKind, String, bool, Vec<Block>)> = Vec::new();
+    // （種類、標題、是否展開、開頭記號的位置、裡面的區塊）
+    let mut stack: Vec<(ContainerKind, String, bool, usize, Vec<Block>)> = Vec::new();
     let mut out = Vec::new();
-    for b in blocks {
+    let close = |stack: &mut Vec<(ContainerKind, String, bool, usize, Vec<Block>)>, out: &mut Vec<(usize, Block)>| {
+        if let Some((kind, title, open, offset, inner)) = stack.pop() {
+            let block = Block::Container { kind, title, open, blocks: inner };
+            match stack.last_mut() {
+                Some(parent) => parent.4.push(block),
+                None => out.push((offset, block)),
+            }
+        }
+    };
+    for (offset, b) in blocks {
         if let Block::Html(h) = &b {
             let t = h.trim();
             if let Some(rest) = t.strip_prefix(MARK_OPEN).and_then(|r| r.strip_suffix("-->")) {
@@ -1041,32 +1106,22 @@ fn fold_containers(blocks: Vec<Block>) -> Vec<Block> {
                 let kind = parts.next().and_then(ContainerKind::parse).unwrap_or(ContainerKind::Info);
                 let open = parts.next() == Some("1");
                 let title = unhex(parts.next().unwrap_or(""));
-                stack.push((kind, title, open, Vec::new()));
+                stack.push((kind, title, open, offset, Vec::new()));
                 continue;
             }
             if t == MARK_END {
-                if let Some((kind, title, open, inner)) = stack.pop() {
-                    let block = Block::Container { kind, title, open, blocks: inner };
-                    match stack.last_mut() {
-                        Some(parent) => parent.3.push(block),
-                        None => out.push(block),
-                    }
-                }
+                close(&mut stack, &mut out);
                 continue;
             }
         }
         match stack.last_mut() {
-            Some(parent) => parent.3.push(b),
-            None => out.push(b),
+            Some(parent) => parent.4.push(b),
+            None => out.push((offset, b)),
         }
     }
     // 沒有關閉的提示框：直接收尾
-    while let Some((kind, title, open, inner)) = stack.pop() {
-        let block = Block::Container { kind, title, open, blocks: inner };
-        match stack.last_mut() {
-            Some(parent) => parent.3.push(block),
-            None => out.push(block),
-        }
+    while !stack.is_empty() {
+        close(&mut stack, &mut out);
     }
     out
 }
@@ -1144,6 +1199,31 @@ mod tests {
         assert_eq!(h[0].id, "標題-一");
         assert_eq!(h[1].id, "hello-world");
         assert_eq!(h[2].id, "hello-world-1");
+    }
+
+    #[test]
+    fn source_offsets() {
+        let src = "---\ntitle: x\n---\n\n# 一\n\n段落\n\n:::info\n## 框內\n\n內文\n:::\n\n- 清單\n\n---\n\n> ## 引言裡\n\n最後\n";
+        let d = parse(src);
+        assert_eq!(d.offsets.len(), d.blocks.len());
+        assert!(d.offsets.windows(2).all(|w| w[0] < w[1]), "{:?}", d.offsets);
+        let at = |i: usize| &src[d.offsets[i]..];
+        assert!(matches!(d.blocks[0], Block::Heading { .. }) && at(0).starts_with("# 一"));
+        assert!(matches!(d.blocks[1], Block::Paragraph(_)) && at(1).starts_with("段落"));
+        // 提示框前面的文字經過前處理（位置會位移），仍要對回原始文字
+        assert!(matches!(d.blocks[2], Block::Container { .. }) && at(2).starts_with(":::info"), "{:?}", at(2));
+        assert!(matches!(d.blocks[3], Block::List { .. }) && at(3).starts_with("- 清單"), "{:?}", at(3));
+        assert!(matches!(d.blocks[4], Block::Rule) && at(4).starts_with("---"));
+        assert!(matches!(d.blocks[5], Block::Quote(_)) && at(5).starts_with("> ## 引言裡"));
+        assert!(at(6).starts_with("最後"));
+
+        // 標題（含提示框、引言裡的）也各自記得位置
+        let h = d.headings();
+        let texts: Vec<&str> = h.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, ["一", "框內", "引言裡"]);
+        assert!(src[h[0].offset..].starts_with("# 一"));
+        assert!(src[h[1].offset..].starts_with("## 框內"));
+        assert!(src[h[2].offset..].starts_with("## 引言裡"));
     }
 
     #[test]

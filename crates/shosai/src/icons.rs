@@ -36,6 +36,8 @@ pub enum Icon {
     Text,
     /// 排序
     Sort,
+    /// 關閉（×）
+    Close,
 }
 
 /// 圖示按鈕：平時只有圖示，滑過時出現淡淡的底色。
@@ -112,6 +114,10 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Sidebar => {
             p.rect_stroke(Rect::from_min_max(at(0.08, 0.15), at(0.92, 0.85)), 2.0, s, egui::StrokeKind::Middle);
             p.line_segment([at(0.38, 0.15), at(0.38, 0.85)], s);
+        }
+        Icon::Close => {
+            p.line_segment([at(0.24, 0.24), at(0.76, 0.76)], s);
+            p.line_segment([at(0.76, 0.24), at(0.24, 0.76)], s);
         }
         Icon::Plus => {
             p.line_segment([at(0.5, 0.18), at(0.5, 0.82)], s);

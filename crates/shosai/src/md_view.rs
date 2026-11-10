@@ -8,7 +8,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::find::find_all;
 use crate::images::{self, ImageCache};
+use crate::scroll_map::{self, char_offsets};
 use eframe::egui::{self, Align, Color32, RichText, Stroke, TextStyle};
 use shosai_core::hmd::{self, Align as CellAlign, Block, ContainerKind, Inline, MdDoc};
 
@@ -20,6 +22,17 @@ pub enum ViewEvent {
     OpenLink(String),
 }
 
+/// 大綱中的一個標題。
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutlineItem {
+    pub level: u8,
+    pub text: String,
+    /// 預覽中的錨點
+    pub id: String,
+    /// 在原始文字中是第幾個字元
+    pub chars: usize,
+}
+
 #[derive(Default)]
 pub struct MdView {
     source_hash: u64,
@@ -29,6 +42,40 @@ pub struct MdView {
     scroll_to: Option<String>,
     /// 本機點陣圖（背景解碼、縮小後的貼圖）
     images: ImageCache,
+    /// 文件中的標題（大綱）
+    outline: Vec<OutlineItem>,
+    /// 每個最上層區塊在原始文字中是第幾個字元
+    block_chars: Vec<usize>,
+    /// 原始文字的總字元數
+    text_chars: usize,
+    /// 對位點：（原始文字的字元位置、畫在內容裡多高），見 [`scroll_map`]
+    anchors: Vec<(f32, f32)>,
+    /// 畫面最上緣對應到原始文字的第幾個字（上一次顯示時）
+    pub view_top: f32,
+    /// 同上，但取畫面上緣往下一點的位置：用來判斷「現在讀到哪個標題」
+    pub probe: f32,
+    /// 畫面最上緣在內容裡的高度（上一次顯示時）
+    view_y: f32,
+    /// 這一幀要把原始文字的這個位置捲到畫面最上緣（切換模式時保持位置）
+    sync_to: Option<f32>,
+    /// 尋找：要標示的字、是否區分大小寫
+    find: Option<(String, bool)>,
+    /// 目前是第幾個符合的位置；`find_jump` 時把它捲到看得到的地方
+    find_current: Option<usize>,
+    find_jump: bool,
+    /// 畫面上符合的數量（上一次顯示時）
+    pub find_count: usize,
+}
+
+const FIND_FG: Color32 = Color32::from_rgb(40, 36, 30);
+
+/// 尋找結果的底色：目前這一個用比較深的橘色。
+fn find_bg(current: bool) -> Color32 {
+    if current {
+        Color32::from_rgb(255, 150, 50)
+    } else {
+        Color32::from_rgb(255, 213, 79)
+    }
 }
 
 enum MathEntry {
@@ -39,6 +86,10 @@ enum MathEntry {
     },
     Failed(String),
 }
+
+/// 「現在讀到哪個標題」看的是畫面上緣往下這麼多的位置：
+/// 標題剛好捲到最上面時算它自己，而不是上一個標題。
+pub const PROBE_BELOW_TOP: f32 = 12.0;
 
 /// 每一幀最多花多少時間排版新的數學式（其餘留到下一幀，避免卡住介面）。
 const MATH_BUDGET: Duration = Duration::from_millis(40);
@@ -55,6 +106,52 @@ struct Ctx<'a> {
     list_depth: usize,
     base_dir: &'a Path,
     images: &'a ImageCache,
+    find: Option<&'a (String, bool)>,
+    /// 到目前為止畫了幾個符合的位置
+    find_seen: usize,
+    find_current: Option<usize>,
+    find_jump: bool,
+}
+
+impl Ctx<'_> {
+    /// 把一段文字依尋找結果切開：（文字、是否符合；符合時再分是不是目前這一個）。
+    fn split<'t>(&mut self, t: &'t str) -> Vec<(&'t str, Option<bool>)> {
+        let hits = match self.find {
+            Some((query, case)) => find_all(t, query, *case),
+            None => Vec::new(),
+        };
+        if hits.is_empty() {
+            return vec![(t, None)];
+        }
+        let mut out = Vec::with_capacity(hits.len() * 2 + 1);
+        let mut pos = 0;
+        for m in hits {
+            if m.bytes.start > pos {
+                out.push((&t[pos..m.bytes.start], None));
+            }
+            out.push((&t[m.bytes.clone()], Some(self.next_hit())));
+            pos = m.bytes.end;
+        }
+        if pos < t.len() {
+            out.push((&t[pos..], None));
+        }
+        out
+    }
+
+    /// 記一個符合的位置；回傳它是不是「目前這一個」。
+    fn next_hit(&mut self) -> bool {
+        let current = self.find_current == Some(self.find_seen);
+        self.find_seen += 1;
+        current
+    }
+
+    /// 目前這一個符合的位置：需要的話捲到畫面中間。
+    fn reveal(&mut self, resp: &egui::Response, hit: Option<bool>) {
+        if hit == Some(true) && self.find_jump {
+            resp.scroll_to_me(Some(Align::Center));
+            self.find_jump = false;
+        }
+    }
 }
 
 /// 行內樣式狀態。
@@ -72,16 +169,61 @@ struct Style {
 }
 
 impl MdView {
-    /// 顯示 Markdown。`base_dir` 用來解析相對路徑的圖片。
-    pub fn show(&mut self, ui: &mut egui::Ui, source: &str, base_dir: &Path) -> Vec<ViewEvent> {
+    /// 解析 Markdown（內容沒變就不重做）。大綱在不顯示預覽的編輯模式也要用，所以獨立出來。
+    pub fn parse(&mut self, source: &str) {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         source.hash(&mut hasher);
         let hash = hasher.finish();
-        if hash != self.source_hash || self.source_hash == 0 {
-            self.doc = Arc::new(hmd::parse(source));
-            self.source_hash = hash;
+        if hash == self.source_hash && self.source_hash != 0 {
+            return;
         }
+        let doc = hmd::parse(source);
+        let headings = doc.headings();
+        let offsets: Vec<usize> = headings.iter().map(|h| h.offset).collect();
+        self.outline = headings
+            .into_iter()
+            .zip(char_offsets(source, &offsets))
+            .map(|(h, chars)| OutlineItem { level: h.level, text: h.text, id: h.id, chars })
+            .collect();
+        self.block_chars = char_offsets(source, &doc.offsets);
+        self.text_chars = source.chars().count();
+        self.doc = Arc::new(doc);
+        self.source_hash = hash;
+    }
+
+    pub fn outline(&self) -> &[OutlineItem] {
+        &self.outline
+    }
+
+    /// 下一次顯示時，把原始文字第 `source` 個字捲到畫面最上緣。
+    ///
+    /// 只適合捲一次（切換模式）：egui 依差量捲動要隔兩幀才生效，連續呼叫會重複計算。
+    /// 要每一幀都跟著捲（分割模式同步）請用 [`MdView::scroll_delta_to`] 自己設定捲動位置。
+    pub fn sync_to(&mut self, source: f32) {
+        self.sync_to = Some(source);
+    }
+
+    /// 依上一次顯示的版面：要讓原始文字第 `source` 個字在畫面最上緣，還要往下捲多少。
+    pub fn scroll_delta_to(&self, source: f32) -> f32 {
+        scroll_map::y_at(&self.anchors, source) - self.view_y
+    }
+
+    /// 設定要標示的尋找結果。`current` 是目前第幾個，`jump` 時把它捲到看得到的地方。
+    pub fn set_find(&mut self, find: Option<(&str, bool)>, current: Option<usize>, jump: bool) {
+        match (find, &mut self.find) {
+            (Some((q, case)), Some((old, old_case))) if old == q && *old_case == case => {}
+            (Some((q, case)), _) => self.find = Some((q.to_string(), case)),
+            (None, _) => self.find = None,
+        }
+        self.find_current = current;
+        self.find_jump = jump;
+    }
+
+    /// 顯示 Markdown。`base_dir` 用來解析相對路徑的圖片。
+    pub fn show(&mut self, ui: &mut egui::Ui, source: &str, base_dir: &Path) -> Vec<ViewEvent> {
+        self.parse(source);
         let doc = self.doc.clone();
+        let find = self.find.clone();
         let mut cx = Ctx {
             doc: &doc,
             base_uri: format!("file://{}/", base_dir.to_string_lossy().replace('\\', "/")),
@@ -94,10 +236,20 @@ impl MdView {
             list_depth: 0,
             base_dir,
             images: &self.images,
+            find: find.as_ref(),
+            find_seen: 0,
+            find_current: self.find_current,
+            find_jump: self.find_jump,
         };
-        ui.vertical(|ui| {
+        // 記下每個最上層區塊畫在多高（相對於內容頂端），之後才能和原始文字的位置對起來
+        let origin = ui.cursor().top();
+        let mut tops = Vec::with_capacity(doc.blocks.len());
+        let inner = ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = cx.body * 0.6;
-            blocks(ui, &doc.blocks, &mut cx);
+            for b in &doc.blocks {
+                tops.push(ui.cursor().top() - origin);
+                block(ui, b, &mut cx);
+            }
             if !doc.footnotes.is_empty() {
                 ui.add_space(cx.body * 1.5);
                 ui.label(RichText::new("註腳").size(cx.body * 0.8).weak());
@@ -115,6 +267,31 @@ impl MdView {
             ui.ctx().request_repaint();
         }
         let events = std::mem::take(&mut cx.events);
+        self.find_count = cx.find_seen;
+        self.find_jump = false;
+
+        // 對位點：每個區塊一個，最後加上文件結尾
+        let bottom = inner.response.rect.bottom() - origin;
+        self.anchors.clear();
+        // 第一個區塊之前的原始文字（例如 front matter）不會畫出來：在畫面上高度是 0
+        if self.block_chars.first().is_some_and(|c| *c > 0) {
+            self.anchors.push((0.0, 0.0));
+        }
+        self.anchors.extend(self.block_chars.iter().zip(&tops).map(|(c, y)| (*c as f32, *y)));
+        self.anchors.push((self.text_chars as f32, bottom.max(tops.last().copied().unwrap_or(0.0))));
+        let view_y = ui.clip_rect().top() - origin;
+        self.view_y = view_y;
+        self.view_top = scroll_map::source_at(&self.anchors, view_y);
+        self.probe = scroll_map::source_at(&self.anchors, view_y + PROBE_BELOW_TOP);
+        if let Some(source) = self.sync_to.take() {
+            let delta = scroll_map::y_at(&self.anchors, source) - view_y;
+            if delta.abs() > 0.5 {
+                // 正值是把內容往下推，所以要往下捲時給負值
+                ui.scroll_with_delta_animation(egui::vec2(0.0, -delta), egui::style::ScrollAnimation::none());
+                ui.ctx().request_repaint();
+            }
+        }
+
         // 清掉太舊的數學式快取（避免一直編輯時無限增長）
         if self.math.len() > 2000 {
             self.math.clear();
@@ -177,7 +354,7 @@ fn block(ui: &mut egui::Ui, b: &Block, cx: &mut Ctx) {
                 Stroke::new(3.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
             );
         }
-        Block::Code { lang, code, line_start } => code_block(ui, lang, code, *line_start),
+        Block::Code { lang, code, line_start } => code_block(ui, lang, code, *line_start, cx),
         Block::Math(tex) => {
             ui.vertical_centered(|ui| math(ui, tex, true, cx));
         }
@@ -335,7 +512,7 @@ fn table_cell(ui: &mut egui::Ui, cell: &[Inline], align: Option<&CellAlign>, hea
     });
 }
 
-fn code_block(ui: &mut egui::Ui, lang: &str, code: &str, line_start: Option<usize>) {
+fn code_block(ui: &mut egui::Ui, lang: &str, code: &str, line_start: Option<usize>, cx: &mut Ctx) {
     let theme = egui_extras::syntax_highlighting::CodeTheme::from_style(ui.style());
     egui::Frame::new()
         .fill(ui.visuals().code_bg_color)
@@ -352,10 +529,66 @@ fn code_block(ui: &mut egui::Ui, lang: &str, code: &str, line_start: Option<usiz
                     let numbers: String = (start..start + n).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
                     ui.label(RichText::new(numbers).monospace().weak());
                 }
-                let job = egui_extras::syntax_highlighting::highlight(ui.ctx(), ui.style(), &theme, code, lang);
-                ui.add(egui::Label::new(job).wrap());
+                let mut job = egui_extras::syntax_highlighting::highlight(ui.ctx(), ui.style(), &theme, code, lang);
+                // 尋找結果：在語法上色的結果上再疊底色
+                let hits = match cx.find {
+                    Some((query, case)) if job.text == code => find_all(code, query, *case),
+                    _ => Vec::new(),
+                };
+                let mut current_here = false;
+                let marks: Vec<(std::ops::Range<usize>, bool)> = hits
+                    .into_iter()
+                    .map(|m| {
+                        let current = cx.next_hit();
+                        current_here |= current;
+                        (m.bytes, current)
+                    })
+                    .collect();
+                mark_job(&mut job, &marks);
+                let resp = ui.add(egui::Label::new(job).wrap());
+                cx.reveal(&resp, current_here.then_some(true));
             });
         });
+}
+
+/// 在排好樣式的文字上，把 `marks`（位元組範圍、是否為目前這一個）的部分加上尋找結果的底色。
+fn mark_job(job: &mut egui::text::LayoutJob, marks: &[(std::ops::Range<usize>, bool)]) {
+    use egui::text::{ByteIndex, LayoutSection};
+    if marks.is_empty() {
+        return;
+    }
+    let mut out = Vec::with_capacity(job.sections.len() + marks.len() * 2);
+    for sec in std::mem::take(&mut job.sections) {
+        let (start, end) = (sec.byte_range.start.0, sec.byte_range.end.0);
+        // 縮排只屬於這一段的第一小段
+        let mut leading = sec.leading_space;
+        let mut push = |a: usize, b: usize, format: egui::TextFormat| {
+            out.push(LayoutSection {
+                leading_space: std::mem::take(&mut leading),
+                byte_range: ByteIndex(a)..ByteIndex(b),
+                format,
+            });
+        };
+        let mut pos = start;
+        for (m, current) in marks {
+            let (a, b) = (m.start.max(pos), m.end.min(end));
+            if a >= b {
+                continue;
+            }
+            if a > pos {
+                push(pos, a, sec.format.clone());
+            }
+            let mut format = sec.format.clone();
+            format.background = find_bg(*current);
+            format.color = FIND_FG;
+            push(a, b, format);
+            pos = b;
+        }
+        if pos < end {
+            push(pos, end, sec.format.clone());
+        }
+    }
+    job.sections = out;
 }
 
 fn paragraph(ui: &mut egui::Ui, inl: &[Inline], cx: &mut Ctx, style: Style) {
@@ -412,17 +645,22 @@ fn styled(text: &str, style: &Style, cx: &Ctx, ui: &egui::Ui) -> RichText {
 }
 
 fn text(ui: &mut egui::Ui, t: &str, cx: &mut Ctx, style: &Style) {
-    let rich = styled(t, style, cx, ui);
-    match &style.link {
-        Some(url) => {
-            let resp = ui.add(egui::Link::new(rich)).on_hover_text(url);
-            if resp.clicked() {
-                cx.events.push(ViewEvent::OpenLink(url.clone()));
+    for (piece, hit) in cx.split(t) {
+        let mut rich = styled(piece, style, cx, ui);
+        if let Some(current) = hit {
+            rich = rich.background_color(find_bg(current)).color(FIND_FG);
+        }
+        let resp = match &style.link {
+            Some(url) => {
+                let resp = ui.add(egui::Link::new(rich)).on_hover_text(url);
+                if resp.clicked() {
+                    cx.events.push(ViewEvent::OpenLink(url.clone()));
+                }
+                resp
             }
-        }
-        None => {
-            ui.add(egui::Label::new(rich));
-        }
+            None => ui.add(egui::Label::new(rich)),
+        };
+        cx.reveal(&resp, hit);
     }
 }
 
@@ -436,7 +674,14 @@ fn inline(ui: &mut egui::Ui, x: &Inline, cx: &mut Ctx, style: &Style) {
         Inline::Text(t) => text(ui, t, cx, style),
         Inline::Code(t) => {
             let size = style.size.unwrap_or(cx.body) * 0.9;
-            ui.add(egui::Label::new(RichText::new(t).code().size(size)));
+            for (piece, hit) in cx.split(t) {
+                let mut rich = RichText::new(piece).code().size(size);
+                if let Some(current) = hit {
+                    rich = rich.background_color(find_bg(current)).color(FIND_FG);
+                }
+                let resp = ui.add(egui::Label::new(rich));
+                cx.reveal(&resp, hit);
+            }
         }
         Inline::Math { tex, display } => {
             if *display {
