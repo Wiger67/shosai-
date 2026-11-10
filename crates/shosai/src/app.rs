@@ -17,7 +17,7 @@ use crate::md_view::{MdView, ViewEvent};
 use crate::novel_view::{NovelEvent, NovelPrefs, NovelView};
 use crate::pdf_view::{Fit, PdfView};
 use crate::theme::{self, Palette};
-use crate::tree::{self, DragItem, Place, TreeCtx};
+use crate::tree::{self, DragItem, Place, TreeCtx, TreeNav};
 
 pub fn run(open: Option<PathBuf>) -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -123,6 +123,8 @@ struct OpenDoc {
     dirty: bool,
     last_edit: Instant,
     mtime: Option<SystemTime>,
+    /// 磁碟上那一版內容的雜湊（開啟或上次儲存時），用來分辨外部是否真的改了內容
+    saved_hash: u64,
     words: usize,
     words_stale: bool,
 }
@@ -266,6 +268,13 @@ pub struct ShosaiApp {
     watcher: Option<FsWatcher>,
     /// 書本模式
     novel: Option<NovelView>,
+    /// 檔案樹的鍵盤操作
+    tree_nav: TreeNav,
+    novel_titles: shosai_core::novel::TitleCache,
+    /// 下一幀讓側欄的搜尋框取得焦點（Ctrl+P）
+    focus_filter: bool,
+    /// 開啟另一個檔案後要捲到的標題（`其他檔.md#標題` 這種連結）
+    pending_anchor: Option<String>,
 }
 
 /// 檔案監看：背景執行緒收到變動後記下時間，畫面在停止變動一小段時間後才重新整理
@@ -400,6 +409,10 @@ impl ShosaiApp {
             applied_theme: None,
             applied_scale: 0.0,
             wheel_zoom: 0.0,
+            tree_nav: TreeNav::default(),
+            novel_titles: Default::default(),
+            focus_filter: false,
+            pending_anchor: None,
             show_settings: false,
             settings_tab: SettingsTab::Appearance,
             scale_draft: None,
@@ -523,10 +536,10 @@ impl ShosaiApp {
         self.settings.novel_open = Some(root.to_path_buf());
     }
 
-    fn novel_book(&self, root: &Path) -> Option<NovelBook> {
+    fn novel_book(&mut self, root: &Path) -> Option<NovelBook> {
         let lib = self.library.as_ref()?;
         let children = lib.children_of(root)?;
-        Some(NovelBook::new(root, children, self.books.get(root)))
+        Some(NovelBook::with_cache(root, children, self.books.get(root), &mut self.novel_titles))
     }
 
     fn refresh_novel(&mut self) {
@@ -536,6 +549,8 @@ impl ShosaiApp {
                 if let Some(n) = self.novel.as_mut() {
                     if n.book != book {
                         n.update_book(book);
+                    } else {
+                        n.files_changed();
                     }
                 }
             }
@@ -694,6 +709,7 @@ impl ShosaiApp {
     fn open_file(&mut self, path: &Path) {
         self.save_current();
         self.reveal_in_tree(path);
+        let anchor = self.pending_anchor.take();
         if shosai_core::is_pdf(path) {
             if cfg!(feature = "pdf") {
                 self.doc = None;
@@ -708,6 +724,7 @@ impl ShosaiApp {
         match std::fs::read_to_string(path) {
             Ok(text) => {
                 let words = markdown::word_count(&text);
+                let saved_hash = content_hash(text.as_bytes());
                 self.pdf = None;
                 self.doc = Some(OpenDoc {
                     path: path.to_path_buf(),
@@ -715,11 +732,15 @@ impl ShosaiApp {
                     dirty: false,
                     last_edit: Instant::now(),
                     mtime: mtime(path),
+                    saved_hash,
                     words,
                     words_stale: false,
                 });
                 self.settings.last_file = Some(path.to_path_buf());
                 self.md_view = MdView::default();
+                if let Some(a) = anchor {
+                    self.md_view.scroll_to(&a);
+                }
             }
             Err(e) => self.error(format!("無法開啟 {}：{e}", path.display())),
         }
@@ -738,24 +759,52 @@ impl ShosaiApp {
         }
     }
 
-    fn save_current(&mut self) {
-        let Some(doc) = self.doc.as_mut() else { return };
+    /// 儲存目前的檔案。回傳是否單純地存好了（失敗或有需要注意的事時回傳 false，訊息已顯示在狀態列）。
+    fn save_current(&mut self) -> bool {
+        let Some(doc) = self.doc.as_mut() else { return true };
         if !doc.dirty {
-            return;
+            return true;
+        }
+        // 開啟之後檔案被別的程式改過（例如同步軟體送進來的新版本）→ 先把那一版另存一份，
+        // 不要直接蓋掉。和 Nextcloud 同步的衝突規則一樣：兩份都保留。
+        let mut kept = None;
+        let on_disk = mtime(&doc.path);
+        if doc.mtime.is_some() && on_disk.is_some() && on_disk != doc.mtime {
+            if let Ok(theirs) = std::fs::read(&doc.path) {
+                if content_hash(&theirs) != doc.saved_hash && theirs != doc.text.as_bytes() {
+                    let copy = conflict_path(&doc.path, &shosai_core::timestamp());
+                    if let Err(e) = std::fs::write(&copy, &theirs) {
+                        let msg = format!("這個檔案在外部被修改過，但無法另存那個版本（{e}），所以先不儲存");
+                        self.error(msg);
+                        return false;
+                    }
+                    kept = Some(copy);
+                }
+            }
         }
         match std::fs::write(&doc.path, &doc.text) {
             Ok(()) => {
                 doc.dirty = false;
                 doc.mtime = mtime(&doc.path);
+                doc.saved_hash = content_hash(doc.text.as_bytes());
                 // 標題可能改了 → 更新書本章節名稱
                 let path = doc.path.clone();
                 if let Some(book) = self.books.values_mut().find(|b| b.chapters.iter().any(|c| c.path == path)) {
                     let _ = book.refresh();
                 }
+                match kept {
+                    Some(copy) => {
+                        let name = copy.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                        self.error(format!("這個檔案在外部被修改過：你的內容已儲存，外部的版本另存為「{name}」"));
+                        false
+                    }
+                    None => true,
+                }
             }
             Err(e) => {
                 let msg = format!("儲存失敗：{e}");
                 self.error(msg);
+                false
             }
         }
     }
@@ -947,9 +996,8 @@ impl ShosaiApp {
                         let ours = shosai_core::is_markdown(&target) || shosai_core::is_pdf(&target);
                         if ours && target.is_file() {
                             self.actions.push(Action::Open(target));
-                            if !anchor.is_empty() {
-                                self.md_view.scroll_to(anchor);
-                            }
+                            // 開檔時預覽會整個重建，所以先記下來，開好之後再捲過去
+                            self.pending_anchor = (!anchor.is_empty()).then(|| anchor.to_string());
                         } else if target.exists() {
                             self.actions.push(Action::Reveal(target));
                         } else {
@@ -1015,12 +1063,23 @@ impl ShosaiApp {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let cmd = Modifiers::COMMAND;
-        let (goto, settings) = ctx.input_mut(|i| {
+        // 在任何地方按下滑鼠 → 方向鍵交還給文件（點檔案樹的資料夾時，放開後會再交給檔案樹）
+        if ctx.input(|i| i.pointer.any_pressed()) || !self.settings.sidebar {
+            self.tree_nav.active = false;
+        }
+        let (goto, settings, find_file) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::G)),
                 i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::Comma)),
+                i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::P)),
             )
         });
+        if find_file {
+            self.settings.sidebar = true;
+            self.focus_filter = true;
+        }
+        // 正在編輯器裡打字時，Ctrl+B 是粗體（在 editor 裡處理），其他時候才是開關側欄
+        let editing = self.doc.as_ref().is_some_and(|d| ctx.memory(|m| m.has_focus(editor_id(&d.path))));
         if goto {
             if let Some(pdf) = self.pdf.as_mut() {
                 pdf.focus_page_input();
@@ -1036,15 +1095,15 @@ impl ShosaiApp {
                 i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::Num2)),
                 i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::Num3)),
                 i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::Num4)),
-                i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::B)),
+                (!editing && i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::B)))
+                    || i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::Backslash)),
                 i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::N)),
                 i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::Equals))
                     || i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::Plus)),
                 i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::Minus)),
             )
         });
-        if save {
-            self.save_current();
+        if save && self.save_current() {
             self.info("已儲存");
         }
         if edit {
@@ -1506,12 +1565,33 @@ impl ShosaiApp {
                     let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, h), egui::Sense::hover());
                     let icon_rect = egui::Rect::from_center_size(r.center(), egui::vec2(14.0, 14.0));
                     icons::paint(ui.painter(), icon_rect, Icon::Search, pal.weak);
-                    ui.add(
+                    let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
-                            .hint_text("搜尋檔案")
+                            .hint_text("搜尋檔案（Ctrl+P）")
                             .frame(egui::Frame::NONE)
                             .desired_width(f32::INFINITY),
                     );
+                    if std::mem::take(&mut self.focus_filter) {
+                        resp.request_focus();
+                    }
+                    if resp.has_focus() && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
+                        // ↓：移到清單的第一列，接著用方向鍵選、Enter 開啟
+                        resp.surrender_focus();
+                        self.tree_nav.active = true;
+                        self.tree_nav.cursor = self.tree_nav.rows.first().map(|r| r.path.clone());
+                    }
+                    if resp.lost_focus() {
+                        // Esc（egui 會先讓輸入框失去焦點）：清掉搜尋。把按鍵用掉，免得同時結束書本模式
+                        if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                            self.filter.clear();
+                        }
+                        // Enter：直接開啟第一個符合的檔案
+                        if !self.filter.trim().is_empty() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                            if let Some(first) = self.tree_nav.first_file() {
+                                self.actions.push(Action::Open(first.to_path_buf()));
+                            }
+                        }
+                    }
                 });
             });
         ui.add_space(8.0);
@@ -1520,8 +1600,10 @@ impl ShosaiApp {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
             let lib = self.library.as_ref().unwrap();
+            self.tree_nav.rows.clear();
             let mut cx = TreeCtx {
                 current: current.as_deref(),
+                nav: &mut self.tree_nav,
                 books: &self.books,
                 actions: &mut self.actions,
                 expanded: &mut self.settings.expanded,
@@ -1561,6 +1643,10 @@ impl ShosaiApp {
                 );
             } else {
                 tree::entries(ui, &lib.entries, 0, &mut cx);
+            }
+            // 鍵盤操作（有對話框或輸入框取得焦點時不作用）
+            if self.dialog.is_none() && !self.show_settings && ui.memory(|m| m.focused().is_none()) {
+                tree::keyboard(ui, &mut self.tree_nav, &mut self.settings.expanded, &mut self.actions);
             }
             // 拖到清單下方的空白處 → 移到書庫最上層
             let rest = ui.available_rect_before_wrap();
@@ -1612,6 +1698,7 @@ impl ShosaiApp {
         let size = self.settings.editor_size;
         let proportional = self.settings.editor_proportional;
         let Some(doc) = self.doc.as_mut() else { return };
+        let id = editor_id(&doc.path);
         egui::ScrollArea::vertical().id_salt(("editor", &doc.path)).auto_shrink([false, false]).show(ui, |ui| {
             let full = ui.available_width();
             let width = if centered { full.min(800.0) } else { full };
@@ -1619,10 +1706,30 @@ impl ShosaiApp {
             let pad: i8 = if centered { 28 } else { 22 };
             ui.horizontal(|ui| {
                 ui.add_space(((full - width) / 2.0).max(0.0));
+                // 格式快捷鍵：要在編輯器處理按鍵之前先攔下來
+                let mut formatted = false;
+                if ui.memory(|m| m.has_focus(id)) {
+                    let cmd = Modifiers::COMMAND;
+                    let marks = ui.input_mut(|i| {
+                        if i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::B)) {
+                            Some(("**", "**"))
+                        } else if i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::I)) {
+                            Some(("*", "*"))
+                        } else if i.consume_shortcut(&KeyboardShortcut::new(cmd, Key::K)) {
+                            Some(("[", "]()"))
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some((open, close)) = marks {
+                        formatted = format_selection(ui.ctx(), id, &mut doc.text, open, close);
+                    }
+                }
                 let response = egui::Frame::new()
                     .inner_margin(egui::Margin::symmetric(pad, 6))
                     .show(ui, |ui| {
                         let edit = egui::TextEdit::multiline(&mut doc.text)
+                            .id(id)
                             .font(if proportional { FontId::proportional(size) } else { FontId::monospace(size) })
                             .desired_width(width - 2.0 * pad as f32)
                             .desired_rows(30)
@@ -1632,7 +1739,7 @@ impl ShosaiApp {
                         ui.add(edit)
                     })
                     .inner;
-                if response.changed() {
+                if response.changed() || formatted {
                     doc.dirty = true;
                     doc.words_stale = true;
                     doc.last_edit = Instant::now();
@@ -1691,6 +1798,8 @@ impl ShosaiApp {
         let events = &mut self.view_events;
         let actions = &mut self.actions;
         let dark = ui.visuals().dark_mode;
+        // 檔案樹正在用方向鍵時，不要同時捲動文件
+        let scroll_keys = !self.tree_nav.active;
 
         egui::Frame::new().fill(desk).show(ui, |ui| {
             egui::ScrollArea::vertical().id_salt(("reader", &path)).auto_shrink([false, false]).show(ui, |ui| {
@@ -1762,6 +1871,9 @@ impl ShosaiApp {
                         });
                 });
                 ui.add_space(36.0);
+                if scroll_keys {
+                    crate::keys::scroll(ui, ui.min_rect(), true);
+                }
             });
         });
     }
@@ -2168,11 +2280,18 @@ impl ShosaiApp {
                             ("Ctrl+1 / 2 / 3", "編輯 / 分割 / 閱讀"),
                             ("Ctrl+4", "書本模式（從這一章開始）"),
                             ("← → 空白鍵", "書本模式翻頁（直排時 ← 是下一頁）"),
+                            ("Ctrl+PageDown / PageUp", "書本模式：下一章 / 回到章首、上一章"),
                             ("T / Esc", "書本模式：目錄 / 結束"),
-                            ("Ctrl+B", "顯示 / 隱藏側欄"),
+                            ("Ctrl+B、Ctrl+\\", "顯示 / 隱藏側欄"),
+                            ("Ctrl+B / I / K", "編輯時：粗體 / 斜體 / 連結"),
+                            ("Ctrl+P", "搜尋檔案（↓ 選擇、Enter 開啟）"),
                             ("Ctrl+= / Ctrl+-、Ctrl+滾輪", "放大 / 縮小（PDF 為縮放）"),
                             ("← / →", "閱讀模式翻章；PDF 翻頁"),
-                            ("Home / End", "PDF 第一頁 / 最後一頁"),
+                            ("↑ ↓ 空白鍵", "閱讀模式、PDF 捲動（Shift+空白鍵往上）"),
+                            ("PageUp / PageDown", "閱讀模式捲一個畫面；PDF 上一頁 / 下一頁"),
+                            ("Home / End", "閱讀模式最前 / 最後；PDF 第一頁 / 最後一頁"),
+                            ("檔案樹：↑ ↓ ← →", "移動、收合 / 展開（先點一下資料夾）"),
+                            ("檔案樹：Enter / F2 / Delete", "開啟 / 重新命名 / 移到回收桶"),
                             ("Ctrl+G", "PDF 輸入頁碼跳頁"),
                             ("Ctrl+,", "設定"),
                         ] {
@@ -2362,8 +2481,9 @@ impl eframe::App for ShosaiApp {
             self.handle_novel_events(events);
         } else if self.pdf.is_some() {
             egui::CentralPanel::no_frame().show(ui, |ui| {
+                let keys = !self.tree_nav.active;
                 if let Some(pdf) = self.pdf.as_mut() {
-                    pdf.show(ui, &pal);
+                    pdf.show(ui, &pal, keys);
                 }
             });
         } else if self.doc.is_none() {
@@ -2549,6 +2669,66 @@ fn book_settings_ui(ui: &mut egui::Ui, meta: &mut BookMeta) {
     ui.checkbox(&mut l.toc, "產生目錄");
 }
 
+/// 編輯器輸入框的 id（固定下來，才能在外面查它有沒有焦點、讀寫游標位置）。
+fn editor_id(path: &Path) -> egui::Id {
+    egui::Id::unique(("shosai-editor", path))
+}
+
+fn content_hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
+/// 外部版本另存的檔名：`筆記.md` → `筆記 (衝突 2025-11-04 093000).md`。
+fn conflict_path(path: &Path, stamp: &str) -> PathBuf {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let name = match path.extension() {
+        Some(ext) => format!("{stem} (衝突 {stamp}).{}", ext.to_string_lossy()),
+        None => format!("{stem} (衝突 {stamp})"),
+    };
+    path.with_file_name(name)
+}
+
+/// 把編輯器目前的選取範圍用 Markdown 記號包起來（或拿掉），並更新選取範圍。
+fn format_selection(ctx: &egui::Context, id: egui::Id, text: &mut String, open: &str, close: &str) -> bool {
+    use egui::text::{CCursor, CCursorRange};
+    let Some(mut state) = egui::TextEdit::load_state(ctx, id) else { return false };
+    let Some(range) = state.cursor.char_range() else { return false };
+    let [a, b] = range.sorted_cursors().map(|c| c.index.0);
+    let (a, b) = wrap_selection(text, a, b, open, close);
+    state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(a), CCursor::new(b))));
+    state.store(ctx, id);
+    true
+}
+
+/// 用 `open`／`close` 包住第 `a`～`b` 個字元；已經包住的話就拿掉。回傳新的選取範圍（以字元計）。
+fn wrap_selection(text: &mut String, a: usize, b: usize, open: &str, close: &str) -> (usize, usize) {
+    let byte = |text: &str, ci: usize| text.char_indices().nth(ci).map_or(text.len(), |(i, _)| i);
+    let (ba, bb) = (byte(text, a), byte(text, b));
+    let ol = open.chars().count();
+    if open == "[" {
+        // 連結：游標放進小括號裡，接著貼上或輸入網址
+        text.insert_str(bb, close);
+        text.insert_str(ba, open);
+        let at = b + ol + 2;
+        return (at, at);
+    }
+    let (before, after) = (&text[..ba], &text[bb..]);
+    // 判斷斜體時，不要把 `**粗體**` 的星號當成斜體的
+    let only_bold = open == "*" && before.ends_with("**") && !before.ends_with("***");
+    if before.ends_with(open) && after.starts_with(close) && !only_bold {
+        text.replace_range(bb..bb + close.len(), "");
+        text.replace_range(ba - open.len()..ba, "");
+        (a - ol, b - ol)
+    } else {
+        text.insert_str(bb, close);
+        text.insert_str(ba, open);
+        (a + ol, b + ol)
+    }
+}
+
 fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
@@ -2574,4 +2754,45 @@ fn open_path(path: &Path) {
         c
     };
     let _ = cmd.spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_and_unwrap() {
+        let mut t = String::from("這是重點喔");
+        assert_eq!(wrap_selection(&mut t, 2, 4, "**", "**"), (4, 6));
+        assert_eq!(t, "這是**重點**喔");
+        assert_eq!(wrap_selection(&mut t, 4, 6, "**", "**"), (2, 4));
+        assert_eq!(t, "這是重點喔");
+        // 沒有選取：插入一對記號，游標在中間
+        assert_eq!(wrap_selection(&mut t, 5, 5, "*", "*"), (6, 6));
+        assert_eq!(t, "這是重點喔**");
+    }
+
+    #[test]
+    fn italic_inside_bold() {
+        let mut t = String::from("**粗體**");
+        assert_eq!(wrap_selection(&mut t, 2, 4, "*", "*"), (3, 5));
+        assert_eq!(t, "***粗體***");
+        assert_eq!(wrap_selection(&mut t, 3, 5, "*", "*"), (2, 4));
+        assert_eq!(t, "**粗體**");
+    }
+
+    #[test]
+    fn link() {
+        let mut t = String::from("看書齋的說明");
+        assert_eq!(wrap_selection(&mut t, 1, 3, "[", "]()"), (6, 6));
+        assert_eq!(t, "看[書齋]()的說明");
+    }
+
+    #[test]
+    fn conflict_names() {
+        let p = conflict_path(Path::new("書/筆記.md"), "2025-11-04 093000");
+        assert_eq!(p, Path::new("書/筆記 (衝突 2025-11-04 093000).md"));
+        let p = conflict_path(Path::new("書/README"), "x");
+        assert_eq!(p, Path::new("書/README (衝突 x)"));
+    }
 }

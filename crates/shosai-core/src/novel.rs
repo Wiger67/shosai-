@@ -4,7 +4,10 @@
 //! - 把 Markdown 簡化成適合分頁排版的段落（標題、內文、場景分隔、插圖…）
 //! - 支援小說網站常見的注音（ルビ）寫法：`｜漢字《かんじ》`
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::hmd::{self, Block, Inline};
 use crate::library::{Entry, EntryKind};
@@ -30,14 +33,25 @@ pub struct NovelBook {
     pub chapters: Vec<NovelChapter>,
 }
 
+/// 章名快取：路徑 →（檔案修改時間、章名）。
+///
+/// 章名要讀檔案裡的第一個標題才知道；檔案樹每次更新都會重建一次書，
+/// 有了快取就只需要重讀真的改過的那幾章。
+pub type TitleCache = HashMap<PathBuf, (Option<SystemTime>, String)>;
+
 impl NovelBook {
     /// 由檔案樹建立。`children` 是這個資料夾裡已排序的項目；
     /// `book` 為 `book.toml` 書本時使用它的章節順序與書名。
     pub fn new(root: &Path, children: &[Entry], book: Option<&Book>) -> NovelBook {
+        Self::with_cache(root, children, book, &mut TitleCache::new())
+    }
+
+    /// 同 [`NovelBook::new`]，但章名先查 `titles`，沒改過的檔案不再重讀。
+    pub fn with_cache(root: &Path, children: &[Entry], book: Option<&Book>, titles: &mut TitleCache) -> NovelBook {
         let mut chapters = Vec::new();
         match book {
             Some(b) => chapters_of_book(b, None, &mut chapters),
-            None => collect(children, None, &mut chapters),
+            None => collect(children, None, titles, &mut chapters),
         }
         let folder = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         NovelBook {
@@ -67,20 +81,26 @@ fn chapters_of_book(book: &Book, volume: Option<&str>, out: &mut Vec<NovelChapte
     }
 }
 
-fn collect(entries: &[Entry], volume: Option<&str>, out: &mut Vec<NovelChapter>) {
+fn collect(entries: &[Entry], volume: Option<&str>, titles: &mut TitleCache, out: &mut Vec<NovelChapter>) {
     for e in entries {
         match e.kind {
-            EntryKind::Markdown => out.push(NovelChapter {
-                path: e.path.clone(),
-                title: crate::book::chapter_title(&e.path),
-                volume: volume.map(str::to_string),
-            }),
+            EntryKind::Markdown => {
+                let title = match titles.get(&e.path) {
+                    Some((stamp, title)) if e.modified.is_some() && *stamp == e.modified => title.clone(),
+                    _ => {
+                        let title = crate::book::chapter_title(&e.path);
+                        titles.insert(e.path.clone(), (e.modified, title.clone()));
+                        title
+                    }
+                };
+                out.push(NovelChapter { path: e.path.clone(), title, volume: volume.map(str::to_string) });
+            }
             EntryKind::Dir => {
                 let name = match volume {
                     Some(v) => format!("{v} / {}", e.name),
                     None => e.name.clone(),
                 };
-                collect(&e.children, Some(&name), out);
+                collect(&e.children, Some(&name), titles, out);
             }
             EntryKind::Book => {
                 if let Ok(b) = Book::open(&e.path) {
@@ -332,15 +352,7 @@ fn push_ruby_text(t: &str, st: St, out: &mut Vec<Span>) {
     while let Some(start) = rest.find(['｜', '|']) {
         let bar_len = rest[start..].chars().next().map(char::len_utf8).unwrap_or(1);
         let after = &rest[start + bar_len..];
-        let parsed = after.find('《').and_then(|open| {
-            let base = &after[..open];
-            let close = after[open..].find('》')? + open;
-            let ruby = &after[open + '《'.len_utf8()..close];
-            let ok =
-                !base.is_empty() && !ruby.is_empty() && base.chars().count() <= 20 && !base.contains(['\n', '|', '｜']);
-            ok.then(|| (base, ruby, close + '》'.len_utf8()))
-        });
-        match parsed {
+        match parse_ruby(after) {
             Some((base, ruby, end)) => {
                 out.push(Span { text: rest[..start].to_string(), ..span(st) });
                 out.push(Span { text: base.to_string(), ruby: Some(ruby.to_string()), ..span(st) });
@@ -353,6 +365,48 @@ fn push_ruby_text(t: &str, st: St, out: &mut Vec<Span>) {
         }
     }
     out.push(Span { text: rest.to_string(), ..span(st) });
+}
+
+/// 直線之後的 `漢字《かんじ》`：回傳（被注音的字、讀音、整段的長度）。
+fn parse_ruby(after: &str) -> Option<(&str, &str, usize)> {
+    let open = after.find('《')?;
+    let base = &after[..open];
+    let close = after[open..].find('》')? + open;
+    let ruby = &after[open + '《'.len_utf8()..close];
+    let ok = !base.is_empty() && !ruby.is_empty() && base.chars().count() <= 20 && !base.contains(['\n', '|', '｜']);
+    ok.then(|| (base, ruby, close + '》'.len_utf8()))
+}
+
+/// 去掉注音的記號與讀音，只留被注音的字：`｜漢字《かんじ》` → `漢字`。
+fn strip_ruby(t: &str) -> Cow<'_, str> {
+    if !t.contains('《') {
+        return Cow::Borrowed(t);
+    }
+    let mut out = String::with_capacity(t.len());
+    let mut rest = t;
+    while let Some(start) = rest.find(['｜', '|']) {
+        let bar_len = rest[start..].chars().next().map(char::len_utf8).unwrap_or(1);
+        let after = &rest[start + bar_len..];
+        match parse_ruby(after) {
+            Some((base, _, end)) => {
+                out.push_str(&rest[..start]);
+                out.push_str(base);
+                rest = &after[end..];
+            }
+            None => {
+                out.push_str(&rest[..start + bar_len]);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// 書本模式的字數：算法和編輯器狀態列的字數相同（中日韓文字每字算一、西文每個單字算一），
+/// 但注音（ルビ）的讀音不算，`｜漢字《かんじ》` 只算「漢字」兩個字。
+pub fn word_count(markdown: &str) -> usize {
+    crate::markdown::word_count_filtered(markdown, strip_ruby)
 }
 
 #[cfg(test)]
@@ -402,6 +456,35 @@ mod tests {
         assert_eq!(nb.chapters[0].title, "相遇");
         assert_eq!(nb.chapters[1].title, "序章");
         assert!(nb.cover.is_some());
+
+        // 章名快取：沒改過的檔案不重讀，改過的（修改時間不同）才重讀
+        let mut titles = TitleCache::new();
+        assert_eq!(NovelBook::with_cache(&dir, &lib.entries, None, &mut titles), nb);
+        assert_eq!(titles.len(), 2);
+        for (_, title) in titles.values_mut() {
+            title.push_str("（快取）");
+        }
+        let cached = NovelBook::with_cache(&dir, &lib.entries, None, &mut titles);
+        assert_eq!(cached.chapters[0].title, "相遇（快取）");
+        let mut entries = lib.entries.clone();
+        fn touch(list: &mut [Entry]) {
+            for e in list {
+                e.modified = e.modified.map(|t| t + std::time::Duration::from_secs(5));
+                touch(&mut e.children);
+            }
+        }
+        touch(&mut entries);
+        assert_eq!(NovelBook::with_cache(&dir, &entries, None, &mut titles), nb);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn word_count_ignores_ruby_readings() {
+        assert_eq!(word_count("她看著｜魔導書《グリモワール》說"), 7);
+        // 書名號不是注音，照算
+        assert_eq!(word_count("讀了《紅樓夢》嗎"), 6);
+        // 沒有注音時和一般的字數統計一樣
+        let md = "# 第一章\n\n　　清晨，她醒了。Hello world.\n\n- 清單\n";
+        assert_eq!(word_count(md), crate::markdown::word_count(md));
     }
 }

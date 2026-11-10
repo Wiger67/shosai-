@@ -73,6 +73,11 @@ pub fn is_cjk(c: char) -> bool {
 
 /// 字數統計：中日韓文字每字算一，其餘以空白分隔的單字算一。
 pub fn word_count(md: &str) -> usize {
+    word_count_filtered(md, |t| std::borrow::Cow::Borrowed(t))
+}
+
+/// 同 [`word_count`]，但每一段文字先經過 `filter`（書本模式用它去掉注音的讀音）。
+pub(crate) fn word_count_filtered(md: &str, filter: fn(&str) -> std::borrow::Cow<'_, str>) -> usize {
     let mut count = 0;
     let mut in_word = false;
     for event in Parser::new_ext(md, options()) {
@@ -83,7 +88,7 @@ pub fn word_count(md: &str) -> usize {
                 continue;
             }
         };
-        for c in text.chars() {
+        for c in filter(&text).chars() {
             if is_cjk(c) {
                 if !c.is_ascii_punctuation() && !matches!(c as u32, 0x3000..=0x303F | 0xFF00..=0xFF0F) {
                     count += 1;

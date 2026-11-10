@@ -12,6 +12,7 @@ mod app;
 mod cli;
 mod icons;
 mod images;
+mod keys;
 mod md_view;
 mod novel_view;
 mod pdf_view;

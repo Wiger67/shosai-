@@ -44,21 +44,42 @@ pub fn button(ui: &mut Ui, icon: Icon, tooltip: &str) -> Response {
 }
 
 pub fn button_sized(ui: &mut Ui, icon: Icon, tooltip: &str, size: f32) -> Response {
+    icon_button(ui, icon, tooltip, size, false)
+}
+
+/// 開關型的圖示按鈕：`active` 時維持底色與強調色，看得出目前是開著的。
+pub fn toggle(ui: &mut Ui, icon: Icon, tooltip: &str, active: bool) -> Response {
+    icon_button(ui, icon, tooltip, 28.0, active)
+}
+
+fn icon_button(ui: &mut Ui, icon: Icon, tooltip: &str, size: f32, active: bool) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
     if ui.is_rect_visible(rect) {
         let v = ui.visuals();
         let enabled = ui.is_enabled();
-        if resp.hovered() && enabled {
+        // 按下的瞬間就有回饋（底色加深、圖示略縮），不必等放開
+        let pressed = enabled && resp.is_pointer_button_down_on();
+        if pressed {
+            ui.painter().rect_filled(rect.shrink(1.0), 6.0, v.widgets.active.weak_bg_fill);
+        } else if active {
+            ui.painter().rect_filled(rect, 6.0, v.selection.bg_fill);
+        } else if resp.hovered() && enabled {
             ui.painter().rect_filled(rect, 6.0, v.widgets.hovered.weak_bg_fill);
+        }
+        if resp.has_focus() {
+            ui.painter().rect_stroke(rect, 6.0, v.selection.stroke, egui::StrokeKind::Inside);
         }
         let color = if !enabled {
             v.weak_text_color().gamma_multiply(0.5)
+        } else if active {
+            v.selection.stroke.color
         } else if resp.hovered() {
             v.strong_text_color()
         } else {
             v.text_color()
         };
-        paint(ui.painter(), Rect::from_center_size(rect.center(), vec2(16.0, 16.0)), icon, color);
+        let icon_size = if pressed { 14.5 } else { 16.0 };
+        paint(ui.painter(), Rect::from_center_size(rect.center(), vec2(icon_size, icon_size)), icon, color);
     }
     if tooltip.is_empty() {
         resp

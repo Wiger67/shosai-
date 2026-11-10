@@ -6,6 +6,7 @@
 //! - 資料夾與書本右側顯示裡面有幾個檔案
 //! - 書本章節用編號徽章標示順序
 //! - 拖曳列可以調整順序（自訂排序）或移到別的資料夾
+//! - 鍵盤操作：↑ ↓ 移動、← → 收合／展開、Enter 開啟、F2 重新命名、Delete 移到回收桶
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -31,8 +32,122 @@ pub enum Place {
     Into,
 }
 
+/// 檔案樹的鍵盤操作狀態。
+#[derive(Default)]
+pub struct TreeNav {
+    /// 方向鍵目前是不是給檔案樹用（點了資料夾，或從搜尋框按 ↓ 進來）
+    pub active: bool,
+    /// 鍵盤游標所在的列
+    pub cursor: Option<PathBuf>,
+    /// 這一幀畫出來的列，由上到下
+    pub rows: Vec<NavRow>,
+}
+
+pub struct NavRow {
+    pub path: PathBuf,
+    depth: usize,
+    /// 資料夾或書本：目前是否展開；檔案為 None
+    open: Option<bool>,
+    rect: Rect,
+}
+
+impl TreeNav {
+    fn has_cursor(&self, path: &Path) -> bool {
+        self.active && self.cursor.as_deref() == Some(path)
+    }
+
+    fn record(&mut self, path: &Path, depth: usize, open: Option<bool>, resp: &egui::Response) {
+        self.rows.push(NavRow { path: path.to_path_buf(), depth, open, rect: resp.rect });
+        if resp.clicked() {
+            // 點資料夾：之後用方向鍵繼續瀏覽；點檔案：鍵盤交還給文件（捲動、翻頁）
+            self.active = open.is_some();
+            self.cursor = Some(path.to_path_buf());
+        }
+    }
+
+    /// 第一個檔案列（搜尋框按 Enter 時開啟）。
+    pub fn first_file(&self) -> Option<&Path> {
+        self.rows.iter().find(|r| r.open.is_none()).map(|r| r.path.as_path())
+    }
+}
+
+/// 處理檔案樹的鍵盤操作。在檔案樹的 ScrollArea 裡、畫完所有列之後呼叫。
+///
+/// 用掉的按鍵會從輸入中移除，後面的閱讀畫面就不會再收到同一個按鍵。
+pub fn keyboard(ui: &Ui, nav: &mut TreeNav, expanded: &mut HashSet<PathBuf>, actions: &mut Vec<Action>) {
+    use egui::Key;
+    if !nav.active || nav.rows.is_empty() {
+        return;
+    }
+    let pressed = |key: Key| ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key));
+    let last = nav.rows.len() - 1;
+    let idx = nav.cursor.as_ref().and_then(|c| nav.rows.iter().position(|r| &r.path == c));
+    let mut target = None;
+    if pressed(Key::ArrowDown) {
+        target = Some(idx.map_or(0, |i| (i + 1).min(last)));
+    }
+    if pressed(Key::ArrowUp) {
+        target = Some(idx.map_or(0, |i| i.saturating_sub(1)));
+    }
+    if pressed(Key::Home) {
+        target = Some(0);
+    }
+    if pressed(Key::End) {
+        target = Some(last);
+    }
+    let (right, left, enter, rename, delete) = (
+        pressed(Key::ArrowRight),
+        pressed(Key::ArrowLeft),
+        pressed(Key::Enter),
+        pressed(Key::F2),
+        pressed(Key::Delete),
+    );
+    if pressed(Key::Escape) {
+        nav.active = false;
+    }
+    if let Some(i) = idx {
+        let row = &nav.rows[i];
+        if right {
+            match row.open {
+                Some(false) => {
+                    expanded.insert(row.path.clone());
+                }
+                Some(true) => target = Some((i + 1).min(last)),
+                None => {}
+            }
+        }
+        if left {
+            if row.open == Some(true) {
+                expanded.remove(&row.path);
+            } else if let Some(parent) = nav.rows[..i].iter().rposition(|r| r.depth < row.depth) {
+                target = Some(parent);
+            }
+        }
+        if enter {
+            match row.open {
+                Some(_) => toggle(expanded, &row.path),
+                None => actions.push(Action::Open(row.path.clone())),
+            }
+        }
+        if rename {
+            let name = row.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            actions.push(Action::Dialog(Dialog::Rename { path: row.path.clone(), name }));
+        }
+        if delete {
+            actions.push(Action::Dialog(Dialog::Trash { path: row.path.clone() }));
+        }
+    }
+    if let Some(t) = target {
+        let row = &nav.rows[t];
+        nav.cursor = Some(row.path.clone());
+        // 上下各多留一列，看得到接下來是什麼
+        ui.scroll_to_rect(row.rect.expand2(vec2(0.0, ROW_H)), None);
+    }
+}
+
 pub struct TreeCtx<'a> {
     pub current: Option<&'a Path>,
+    pub nav: &'a mut TreeNav,
     pub books: &'a HashMap<PathBuf, Book>,
     pub actions: &'a mut Vec<Action>,
     pub expanded: &'a mut HashSet<PathBuf>,
@@ -57,6 +172,8 @@ struct RowSpec<'a> {
     hover: Option<&'a str>,
     /// 可以拖曳
     draggable: bool,
+    /// 鍵盤游標在這一列
+    cursor: bool,
 }
 
 fn row(ui: &mut Ui, spec: RowSpec, pal: &Palette) -> egui::Response {
@@ -75,8 +192,14 @@ fn row(ui: &mut Ui, spec: RowSpec, pal: &Palette) -> egui::Response {
         // 左側強調條
         let bar = Rect::from_min_size(rect.min + vec2(0.0, 6.0), vec2(3.0, rect.height() - 12.0));
         p.rect_filled(bar, 1.5, pal.accent);
+    } else if resp.is_pointer_button_down_on() {
+        // 按下的瞬間就有回饋
+        p.rect_filled(rect, 6.0, pal.selected);
     } else if resp.hovered() {
         p.rect_filled(rect, 6.0, pal.hover);
+    }
+    if spec.cursor {
+        p.rect_stroke(rect, 6.0, Stroke::new(1.5, pal.accent), egui::StrokeKind::Inside);
     }
 
     let mut x = rect.left() + 8.0 + spec.depth as f32 * INDENT;
@@ -212,8 +335,10 @@ pub fn entries(ui: &mut Ui, list: &[Entry], depth: usize, cx: &mut TreeCtx) {
                     on_path,
                     hover: Some(&hover),
                     draggable: true,
+                    cursor: cx.nav.has_cursor(&e.path),
                 };
                 let resp = row(ui, spec, &cx.pal);
+                cx.nav.record(&e.path, depth, Some(open), &resp);
                 dnd(ui, &resp, depth, &e.path, true, cx);
                 if resp.clicked() {
                     toggle(cx.expanded, &e.path);
@@ -251,8 +376,10 @@ pub fn entries(ui: &mut Ui, list: &[Entry], depth: usize, cx: &mut TreeCtx) {
                     on_path,
                     hover: Some(&hover),
                     draggable: true,
+                    cursor: cx.nav.has_cursor(&e.path),
                 };
                 let resp = row(ui, spec, &cx.pal);
+                cx.nav.record(&e.path, depth, Some(open), &resp);
                 dnd(ui, &resp, depth, &e.path, true, cx);
                 if resp.clicked() {
                     toggle(cx.expanded, &e.path);
@@ -287,6 +414,7 @@ fn empty_row(ui: &mut Ui, depth: usize, text: &str, pal: &Palette) {
         on_path: false,
         hover: None,
         draggable: false,
+        cursor: false,
     };
     row(ui, spec, pal);
 }
@@ -307,8 +435,10 @@ pub fn book_contents(ui: &mut Ui, book: &Book, entry: &Entry, depth: usize, cx: 
             on_path: false,
             hover: Some(&ch.rel),
             draggable: true,
+            cursor: cx.nav.has_cursor(&ch.path),
         };
         let resp = row(ui, spec, &cx.pal);
+        cx.nav.record(&ch.path, depth, None, &resp);
         dnd(ui, &resp, depth, &ch.path, false, cx);
         if resp.clicked() && !selected {
             cx.actions.push(Action::Open(ch.path.clone()));
@@ -349,6 +479,7 @@ pub fn book_contents(ui: &mut Ui, book: &Book, entry: &Entry, depth: usize, cx: 
         on_path: false,
         hover: None,
         draggable: false,
+        cursor: false,
     };
     if row(ui, spec, &cx.pal).clicked() {
         cx.actions.push(Action::Dialog(Dialog::NewChapter { book: book.root.clone(), title: String::new() }));
@@ -386,8 +517,10 @@ pub fn file_labeled(ui: &mut Ui, path: &Path, name: &str, is_pdf: bool, depth: u
         on_path: false,
         hover: Some(&hover),
         draggable: true,
+        cursor: cx.nav.has_cursor(path),
     };
     let resp = row(ui, spec, &cx.pal);
+    cx.nav.record(path, depth, None, &resp);
     dnd(ui, &resp, depth, path, false, cx);
     if resp.clicked() && !selected {
         cx.actions.push(Action::Open(path.to_path_buf()));
@@ -470,5 +603,93 @@ pub fn common_menu(ui: &mut Ui, path: &Path, actions: &mut Vec<Action>) {
     if ui.button(RichText::new("移到回收桶").color(ui.visuals().error_fg_color)).clicked() {
         actions.push(Action::Dialog(Dialog::Trash { path: path.to_path_buf() }));
         ui.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::Key;
+
+    fn press(key: Key) -> egui::RawInput {
+        let key = egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        egui::RawInput { events: vec![key], ..Default::default() }
+    }
+
+    fn nav_row(path: &str, depth: usize, open: Option<bool>) -> NavRow {
+        NavRow { path: PathBuf::from(path), depth, open, rect: Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, ROW_H)) }
+    }
+
+    struct Harness {
+        ctx: egui::Context,
+        nav: TreeNav,
+        expanded: HashSet<PathBuf>,
+        actions: Vec<Action>,
+        /// was the key still visible to later widgets after the tree handled it
+        leaked: bool,
+    }
+
+    impl Harness {
+        fn key(&mut self, key: Key) {
+            self.nav.rows = vec![
+                nav_row("dir", 0, Some(self.expanded.contains(Path::new("dir")))),
+                nav_row("dir/a.md", 1, None),
+                nav_row("b.md", 0, None),
+            ];
+            let mut out = self.ctx.run_ui(press(key), |ui| {
+                keyboard(ui, &mut self.nav, &mut self.expanded, &mut self.actions);
+                self.leaked = ui.input(|i| i.key_pressed(key));
+            });
+            // egui panics if texture updates are dropped unhandled
+            out.textures_delta.clear();
+        }
+
+        fn cursor(&self) -> Option<&str> {
+            self.nav.cursor.as_deref().and_then(Path::to_str)
+        }
+    }
+
+    #[test]
+    fn keyboard_navigation() {
+        let mut h = Harness {
+            ctx: egui::Context::default(),
+            nav: TreeNav { active: true, ..Default::default() },
+            expanded: HashSet::new(),
+            actions: Vec::new(),
+            leaked: false,
+        };
+        h.key(Key::ArrowDown);
+        assert_eq!(h.cursor(), Some("dir"));
+        assert!(!h.leaked, "the reader must not see a key the tree used");
+        h.key(Key::ArrowRight);
+        assert!(h.expanded.contains(Path::new("dir")));
+        h.key(Key::ArrowRight);
+        assert_eq!(h.cursor(), Some("dir/a.md"));
+        h.key(Key::Enter);
+        assert!(matches!(h.actions.pop(), Some(Action::Open(p)) if p == Path::new("dir/a.md")));
+        h.key(Key::F2);
+        assert!(matches!(h.actions.pop(), Some(Action::Dialog(Dialog::Rename { name, .. })) if name == "a.md"));
+        h.key(Key::Delete);
+        assert!(matches!(h.actions.pop(), Some(Action::Dialog(Dialog::Trash { .. }))));
+        h.key(Key::ArrowLeft);
+        assert_eq!(h.cursor(), Some("dir"), "left on a file goes to its folder");
+        h.key(Key::ArrowLeft);
+        assert!(!h.expanded.contains(Path::new("dir")));
+        h.key(Key::End);
+        assert_eq!(h.cursor(), Some("b.md"));
+        h.key(Key::ArrowDown);
+        assert_eq!(h.cursor(), Some("b.md"), "stays on the last row");
+        h.key(Key::Escape);
+        assert!(!h.nav.active);
+        // not active: keys are left alone
+        h.key(Key::ArrowUp);
+        assert_eq!(h.cursor(), Some("b.md"));
+        assert!(h.leaked);
     }
 }

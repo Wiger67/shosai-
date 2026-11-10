@@ -86,6 +86,7 @@ pub struct PdfView {
     focus_page_input: bool,
     thumb_follow: Option<usize>,
     view: Option<ViewState>,
+    scroll_keys: bool,
 }
 
 impl PdfView {
@@ -121,6 +122,7 @@ impl PdfView {
             focus_page_input: false,
             thumb_follow: None,
             view: None,
+            scroll_keys: true,
         }
     }
 
@@ -220,7 +222,7 @@ impl PdfView {
     /// 左半部：縮圖開關、上一頁、頁碼輸入、下一頁。
     pub fn toolbar_left(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         let thumbs_tip = if self.show_thumbs { "隱藏頁面縮圖" } else { "顯示頁面縮圖" };
-        if icons::button(ui, Icon::Thumbnails, thumbs_tip).clicked() {
+        if icons::toggle(ui, Icon::Thumbnails, thumbs_tip, self.show_thumbs).clicked() {
             self.show_thumbs = !self.show_thumbs;
         }
         ui.add_space(6.0);
@@ -264,16 +266,7 @@ impl PdfView {
     /// 右半部（由右往左排）：縮放與顯示模式。
     pub fn toolbar_right(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         let spread_tip = if self.spread { "改為單頁" } else { "雙頁並排" };
-        let spread = icons::button(ui, Icon::Spread, spread_tip);
-        if self.spread {
-            ui.painter().rect_stroke(
-                spread.rect.shrink(3.0),
-                6.0,
-                Stroke::new(1.0, pal.accent),
-                egui::StrokeKind::Inside,
-            );
-        }
-        if spread.clicked() {
+        if icons::toggle(ui, Icon::Spread, spread_tip, self.spread).clicked() {
             self.spread = !self.spread;
             let c = self.current;
             self.go_to(c);
@@ -324,7 +317,9 @@ impl PdfView {
     // -----------------------------------------------------------------------
     // 內容
 
-    pub fn show(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+    /// `keys`：是否處理鍵盤捲動（側欄檔案樹正在用方向鍵時關掉）。
+    pub fn show(&mut self, ui: &mut egui::Ui, pal: &Palette, keys: bool) {
+        self.scroll_keys = keys;
         self.poll(ui.ctx());
         if let Some(e) = &self.error {
             ui.centered_and_justified(|ui| {
@@ -451,15 +446,24 @@ impl PdfView {
         self.last_zoom = zoom;
         let (placed, content) = self.layout(avail, zoom);
 
-        let mut area = egui::ScrollArea::both().id_salt(("pdf", &self.path)).auto_shrink([false, false]);
+        // 滑鼠也可以直接拖曳頁面移動（放大後左右移動用）
+        let mut area = egui::ScrollArea::both()
+            .id_salt(("pdf", &self.path))
+            .auto_shrink([false, false])
+            .scroll_source(egui::scroll_area::ScrollSource::ALL);
         if let Some((i, uv, local)) = anchor {
             let r = placed[i];
             let c = r.min + uv * r.size();
             area = area.scroll_offset((c - local).to_vec2().max(egui::Vec2::ZERO));
         }
+        let scroll_keys = self.scroll_keys;
         let out = area.show_viewport(ui, |ui, viewport| {
             let origin = ui.min_rect().min;
             ui.set_min_size(content);
+            if scroll_keys {
+                // ↑ ↓ 與空白鍵捲動；PageUp／PageDown、Home／End 是整頁跳（見 keyboard）
+                crate::keys::scroll(ui, Rect::from_min_size(origin, content), false);
+            }
 
             // 預先渲染上下各半個畫面；超出 1.5 個畫面的頁面釋放貼圖（每頁約 4MB）
             let near = viewport.expand2(vec2(0.0, viewport.height() * 0.5));
@@ -539,6 +543,12 @@ impl PdfView {
                 }
             }
         });
+        let dragging = ui.input(|i| {
+            i.pointer.is_decidedly_dragging() && i.pointer.press_origin().is_some_and(|p| out.inner_rect.contains(p))
+        });
+        if dragging {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
         self.view = Some(ViewState { placed, offset: out.state.clamped_offset(), inner: out.inner_rect });
     }
 

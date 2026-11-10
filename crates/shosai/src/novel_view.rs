@@ -5,13 +5,19 @@
 //! - 行首／行尾禁則（句號、逗號不會出現在行首，開括號不會留在行尾）
 //! - 注音（`｜漢字《かんじ》`）、著重號（`*強調*`）、直排時兩位數字橫向並排（縱中橫）
 //! - 記住每本書讀到的位置（以字數記錄，改變字級或視窗大小也不會跑掉）
+//! - 子資料夾是「卷」：目錄依卷分組、可收合，並統計每章、每卷與全書的字數
 
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::f32::consts::FRAC_PI_2;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver};
 use std::time::SystemTime;
 
 use eframe::egui::{
-    self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Key, Rect, RichText, Sense, Shape, Stroke, Ui,
+    self, pos2, vec2, Align, Align2, Color32, CursorIcon, FontId, Key, Rect, RichText, Sense, Shape, Stroke,
+    TextWrapMode, Ui,
 };
 use serde::{Deserialize, Serialize};
 use shosai_core::novel::{self, NBlock, NovelBook, Span};
@@ -57,6 +63,8 @@ const STRONG: u8 = 1;
 const EMPH: u8 = 2;
 const WEAK: u8 = 4;
 const HEAD: u8 = 8;
+/// 觸控板（以點數回報的捲動）滑多少點翻一頁
+const WHEEL_POINTS_PER_PAGE: f32 = 120.0;
 
 #[derive(Debug, Clone, PartialEq)]
 enum Kind {
@@ -161,10 +169,20 @@ pub struct NovelView {
     /// 目前這一章的內容（路徑、修改時間、段落）
     blocks: Option<(PathBuf, Option<SystemTime>, Vec<NBlock>)>,
     pub show_toc: bool,
-    /// 打開目錄時捲到目前這一章
-    toc_scroll: bool,
+    /// 目錄要捲到目前這一章：`Some(Center)` 置中（剛打開目錄），`None` 只在看不到時才捲（翻到下一章）
+    toc_scroll: Option<Option<Align>>,
+    /// 目錄中收合起來的卷
+    collapsed: HashSet<String>,
+    /// 各章字數：路徑 →（檔案修改時間、字數）。由背景執行緒統計
+    words: HashMap<PathBuf, WordStat>,
+    words_rx: Option<Receiver<(PathBuf, WordStat)>>,
+    /// 需要（重新）統計字數：剛開啟、章節清單或檔案內容有變動
+    recount: bool,
     images: ImageCache,
+    /// 滾輪累積量，以「頁」為單位（滿 1 翻一頁）
     wheel: f32,
+    /// 上一次滾輪事件的時間（隔太久的殘量不算）
+    wheel_at: f64,
     /// 讀完最後一頁時短暫顯示提示
     end_flash: Option<std::time::Instant>,
 }
@@ -184,9 +202,14 @@ impl NovelView {
             layout: None,
             blocks: None,
             show_toc: false,
-            toc_scroll: true,
+            toc_scroll: Some(Some(Align::Center)),
+            collapsed: HashSet::new(),
+            words: HashMap::new(),
+            words_rx: None,
+            recount: true,
             images: ImageCache::default(),
             wheel: 0.0,
+            wheel_at: 0.0,
             end_flash: None,
         }
     }
@@ -208,6 +231,12 @@ impl NovelView {
             None => self.want = Want::First,
         }
         self.layout = None;
+        self.recount = true;
+    }
+
+    /// 書庫裡有檔案變動（章節清單沒變，但內容可能改了）：重新確認各章字數。
+    pub fn files_changed(&mut self) {
+        self.recount = true;
     }
 
     pub fn current_chapter(&self) -> Option<&Path> {
@@ -247,9 +276,45 @@ impl NovelView {
         if self.unit != unit {
             self.unit = unit;
             self.layout = None;
+            // 目錄跟著走：展開這一章所在的卷，看不到的話捲過去
+            self.expand_current_volume();
+            if self.toc_scroll.is_none() {
+                self.toc_scroll = Some(None);
+            }
         }
         self.want = want;
         self.apply_want();
+    }
+
+    fn expand_current_volume(&mut self) {
+        if let Unit::Chapter(i) = self.unit {
+            if let Some(v) = self.book.chapters.get(i).and_then(|c| c.volume.as_ref()) {
+                self.collapsed.remove(v);
+            }
+        }
+    }
+
+    /// 跳到下一章的開頭。
+    fn next_chapter(&mut self) {
+        let next = match self.unit {
+            Unit::Front => 0,
+            Unit::Chapter(i) => i + 1,
+        };
+        if next < self.book.chapters.len() {
+            self.go(Unit::Chapter(next), Want::First);
+        } else {
+            self.end_flash = Some(std::time::Instant::now());
+        }
+    }
+
+    /// 回到這一章的開頭；已經在開頭的話回到上一章。
+    fn prev_chapter(&mut self) {
+        match self.unit {
+            _ if self.page > 0 => self.page = 0,
+            Unit::Chapter(0) => self.go(Unit::Front, Want::First),
+            Unit::Chapter(i) => self.go(Unit::Chapter(i - 1), Want::First),
+            Unit::Front => {}
+        }
     }
 
     fn step(&self, spread: bool) -> usize {
@@ -308,13 +373,87 @@ impl NovelView {
         };
     }
 
-    /// 全書進度（0–1）。
+    // -----------------------------------------------------------------------
+    // 字數
+
+    /// 在背景統計各章字數。只重讀修改時間變了的檔案，所以檔案樹每次更新都可以放心呼叫。
+    fn start_count(&mut self, ctx: &egui::Context) {
+        let jobs: Vec<(PathBuf, Option<Option<SystemTime>>)> =
+            self.book.chapters.iter().map(|c| (c.path.clone(), self.words.get(&c.path).map(|w| w.stamp))).collect();
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new().name("novel-words".into()).spawn(move || {
+            for (path, known) in jobs {
+                let stamp = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                if known == Some(stamp) {
+                    continue;
+                }
+                let words = std::fs::read_to_string(&path).map(|t| novel::word_count(&t)).unwrap_or(0);
+                // 畫面已經關掉（或開始了新一輪統計）就不用再算了
+                if tx.send((path, WordStat { stamp, words })).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+            }
+            // 讓畫面知道統計結束了
+            ctx.request_repaint();
+        });
+        self.words_rx = spawned.is_ok().then_some(rx);
+    }
+
+    fn poll_words(&mut self) {
+        let Some(rx) = &self.words_rx else { return };
+        loop {
+            match rx.try_recv() {
+                Ok((path, stat)) => {
+                    self.words.insert(path, stat);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.words_rx = None;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn chapter_words(&self, i: usize) -> Option<usize> {
+        self.book.chapters.get(i).and_then(|c| self.words.get(&c.path)).map(|w| w.words)
+    }
+
+    /// 一段章節的字數總和；其中還有沒統計完的章時為 `None`。
+    fn words_in(&self, chapters: Range<usize>) -> Option<usize> {
+        chapters.map(|i| self.chapter_words(i)).sum()
+    }
+
+    fn total_words(&self) -> Option<usize> {
+        self.words_in(0..self.book.chapters.len())
+    }
+
+    /// 第 `i` 章所在的那一組：連續、同一卷（同一個子資料夾）的章節。
+    fn volume_range(&self, i: usize) -> Range<usize> {
+        let chapters = &self.book.chapters;
+        let Some(volume) = chapters.get(i).map(|c| &c.volume) else { return i..i };
+        let start = chapters[..i].iter().rposition(|c| &c.volume != volume).map_or(0, |p| p + 1);
+        let end = chapters[i..].iter().position(|c| &c.volume != volume).map_or(chapters.len(), |p| i + p);
+        start..end
+    }
+
+    /// 全書進度（0–1）。字數統計好了就依字數計算（章節長短不一時才準），否則先以章數估計。
     fn progress(&self) -> f32 {
         let n = self.book.chapters.len().max(1) as f32;
         let pages = self.layout.as_ref().map(|l| l.pages.len()).unwrap_or(1).max(1) as f32;
         match self.unit {
             Unit::Front => 0.0,
-            Unit::Chapter(i) => ((i as f32) + (self.page as f32 + 1.0) / pages) / n,
+            Unit::Chapter(i) => {
+                let in_chapter = (self.page as f32 + 1.0) / pages;
+                match (self.words_in(0..i), self.chapter_words(i), self.total_words()) {
+                    (Some(before), Some(this), Some(total)) if total > 0 => {
+                        ((before as f32 + this as f32 * in_chapter) / total as f32).min(1.0)
+                    }
+                    _ => (i as f32 + in_chapter) / n,
+                }
+            }
         }
     }
 
@@ -331,12 +470,32 @@ impl NovelView {
                 }
             }
         };
-        let right = if pages == 0 {
-            String::new()
-        } else {
-            format!("{} / {} 頁　·　全書 {:.0}%", self.page + 1, pages, self.progress() * 100.0)
-        };
-        (left, right)
+        if pages == 0 {
+            return (left, String::new());
+        }
+        let mut right = vec![format!("{} / {} 頁", self.page + 1, pages)];
+        match self.unit {
+            Unit::Front => right.push(format!("共 {} 章", self.book.chapters.len())),
+            Unit::Chapter(i) => {
+                if let Some(w) = self.chapter_words(i) {
+                    right.push(format!("本章 {} 字", group_digits(w)));
+                }
+                // 這一章屬於某一卷（子資料夾）時，也列出整卷的字數
+                if self.book.chapters[i].volume.is_some() {
+                    if let Some(w) = self.words_in(self.volume_range(i)) {
+                        right.push(format!("本卷 {} 字", group_digits(w)));
+                    }
+                }
+            }
+        }
+        right.push(match self.total_words() {
+            Some(w) => format!("全書 {} 字", group_digits(w)),
+            None => "全書字數統計中…".to_string(),
+        });
+        if self.unit != Unit::Front {
+            right.push(format!("{:.0}%", self.progress() * 100.0));
+        }
+        (left, right.join("　·　"))
     }
 
     // -----------------------------------------------------------------------
@@ -399,8 +558,14 @@ impl NovelView {
     // 主畫面
 
     pub fn show(&mut self, ui: &mut Ui, pal: &Palette, prefs: &NovelPrefs, events: &mut Vec<NovelEvent>) {
+        self.poll_words();
+        if std::mem::take(&mut self.recount) {
+            self.start_count(ui.ctx());
+        }
         if !self.show_toc {
-            self.toc_scroll = true;
+            // 下次打開目錄時，目前這一章要看得到
+            self.toc_scroll = Some(Some(Align::Center));
+            self.expand_current_volume();
         } else {
             egui::Panel::left("novel-toc")
                 .show_separator_line(false)
@@ -569,14 +734,24 @@ impl NovelView {
     ) {
         let typing = ui.ctx().memory(|m| m.focused().is_some());
         if !typing {
+            // Ctrl+PageDown／PageUp：下一章／上一章（和閱讀模式一樣）
+            let (next_ch, prev_ch) = ui.input(|i| {
+                (i.modifiers.command && i.key_pressed(Key::PageDown), i.modifiers.command && i.key_pressed(Key::PageUp))
+            });
+            if next_ch {
+                self.next_chapter();
+            }
+            if prev_ch {
+                self.prev_chapter();
+            }
             let (fwd_h, back_h, fwd, back, home, end, esc, toc) = ui.input(|i| {
                 (
                     i.key_pressed(Key::ArrowRight),
                     i.key_pressed(Key::ArrowLeft),
-                    i.key_pressed(Key::PageDown)
+                    (i.key_pressed(Key::PageDown) && !i.modifiers.command)
                         || i.key_pressed(Key::ArrowDown)
                         || (i.key_pressed(Key::Space) && !i.modifiers.shift),
-                    i.key_pressed(Key::PageUp)
+                    (i.key_pressed(Key::PageUp) && !i.modifiers.command)
                         || i.key_pressed(Key::ArrowUp)
                         || (i.key_pressed(Key::Space) && i.modifiers.shift),
                     i.key_pressed(Key::Home),
@@ -608,21 +783,42 @@ impl NovelView {
             }
         }
         if resp.contains_pointer() {
-            let d = ui.input(|i| i.smooth_scroll_delta);
-            let d = if d.y.abs() > d.x.abs() {
-                d.y
-            } else if prefs.vertical {
-                d.x
-            } else {
-                -d.x
-            };
-            self.wheel += d;
-            if self.wheel <= -60.0 {
-                self.wheel = 0.0;
-                self.next_page(spread);
-            } else if self.wheel >= 60.0 {
-                self.wheel = 0.0;
-                self.prev_page(spread);
+            // 直接讀原始的滾輪事件：滑鼠滾輪一格就翻一頁，不必等平滑捲動慢慢累積。
+            // （Ctrl+滾輪是調整字級，不翻頁）
+            let (lines, points, now) = ui.input(|i| {
+                let (mut lines, mut points) = (0.0, 0.0);
+                if !i.modifiers.command {
+                    for e in &i.events {
+                        let egui::Event::MouseWheel { unit, delta, .. } = e else { continue };
+                        let d = if delta.y.abs() >= delta.x.abs() {
+                            delta.y
+                        } else if prefs.vertical {
+                            delta.x
+                        } else {
+                            -delta.x
+                        };
+                        match unit {
+                            egui::MouseWheelUnit::Point => points += d,
+                            _ => lines += d,
+                        }
+                    }
+                }
+                (lines, points, i.time)
+            });
+            if lines != 0.0 || points != 0.0 {
+                if now - self.wheel_at > 0.4 {
+                    self.wheel = 0.0;
+                }
+                self.wheel_at = now;
+                let pages = wheel_pages(&mut self.wheel, lines, points);
+                for _ in 0..pages.abs() {
+                    // 正值是內容往下移＝往回翻
+                    if pages < 0 {
+                        self.next_page(spread);
+                    } else {
+                        self.prev_page(spread);
+                    }
+                }
             }
         }
     }
@@ -632,37 +828,77 @@ impl NovelView {
         if !self.book.author.is_empty() {
             ui.label(RichText::new(&self.book.author).small().color(pal.weak));
         }
+        let n = self.book.chapters.len();
+        let summary = match self.total_words() {
+            Some(w) => format!("共 {n} 章　·　{} 字", group_digits(w)),
+            None => format!("共 {n} 章　·　字數統計中…"),
+        };
+        ui.label(RichText::new(summary).small().color(pal.weak));
         ui.add_space(6.0);
         let mut goto = None;
+        let mut toggle = None;
+        let scroll = self.toc_scroll;
+        let mut scrolled = false;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
-            let front = egui::Button::selectable(self.unit == Unit::Front, "封面與目錄")
-                .min_size(vec2(ui.available_width(), 26.0));
-            if ui.add(front).clicked() {
+            let front = TocRow { text: "封面與目錄", selected: self.unit == Unit::Front, ..Default::default() };
+            if toc_row(ui, pal, front).clicked() {
                 goto = Some(Unit::Front);
             }
-            let mut last_volume: Option<&str> = None;
-            for (i, ch) in self.book.chapters.iter().enumerate() {
-                if ch.volume.as_deref() != last_volume {
-                    last_volume = ch.volume.as_deref();
-                    if let Some(v) = last_volume {
-                        ui.add_space(6.0);
-                        ui.label(RichText::new(v).small().strong().color(pal.weak));
+            // 一卷（一個子資料夾）一組：標題列可以收合，右邊是整卷的字數
+            let mut i = 0;
+            while i < n {
+                let range = self.volume_range(i);
+                let volume = self.book.chapters[i].volume.as_deref();
+                let open = volume.is_none_or(|v| !self.collapsed.contains(v));
+                if let Some(v) = volume {
+                    ui.add_space(4.0);
+                    let header = TocRow {
+                        text: v,
+                        trailing: self.words_in(range.clone()).map(|w| format!("{} 字", group_digits(w))),
+                        chevron: Some(open),
+                        strong: true,
+                        ..Default::default()
+                    };
+                    let r = toc_row(ui, pal, header).on_hover_text(format!("{v}　（{} 章）", range.len()));
+                    if r.clicked() {
+                        toggle = Some(v.to_string());
                     }
                 }
-                let current = self.unit == Unit::Chapter(i);
-                let text = if ch.volume.is_some() { format!("　{}", ch.title) } else { ch.title.clone() };
-                let b = egui::Button::selectable(current, text).min_size(vec2(ui.available_width(), 26.0));
-                let r = ui.add(b);
-                if current && self.toc_scroll {
-                    r.scroll_to_me(Some(egui::Align::Center));
-                    self.toc_scroll = false;
+                if open {
+                    for j in range.clone() {
+                        let ch = &self.book.chapters[j];
+                        let current = self.unit == Unit::Chapter(j);
+                        let row = TocRow {
+                            text: &ch.title,
+                            trailing: self.chapter_words(j).map(group_digits),
+                            selected: current,
+                            indent: if volume.is_some() { 14.0 } else { 0.0 },
+                            ..Default::default()
+                        };
+                        let r = toc_row(ui, pal, row);
+                        if current {
+                            if let Some(align) = scroll {
+                                r.scroll_to_me(align);
+                                scrolled = true;
+                            }
+                        }
+                        if r.clicked() {
+                            goto = Some(Unit::Chapter(j));
+                        }
+                    }
                 }
-                if r.clicked() {
-                    goto = Some(Unit::Chapter(i));
-                }
+                i = range.end.max(i + 1);
             }
         });
+        if scrolled || self.unit == Unit::Front {
+            self.toc_scroll = None;
+        }
+        if let Some(v) = toggle {
+            if !self.collapsed.remove(&v) {
+                self.collapsed.insert(v);
+            }
+        }
         if let Some(u) = goto {
             self.go(u, Want::First);
         }
@@ -710,7 +946,10 @@ impl NovelView {
         p.text(
             pos2(rect.center().x, rect.bottom() - 40.0),
             Align2::CENTER_CENTER,
-            format!("共 {} 章", self.book.chapters.len()),
+            match self.total_words() {
+                Some(w) => format!("共 {} 章　·　{} 字", self.book.chapters.len(), group_digits(w)),
+                None => format!("共 {} 章", self.book.chapters.len()),
+            },
             FontId::proportional(12.0),
             pal.weak,
         );
@@ -726,8 +965,15 @@ impl NovelView {
         if let Some(path) = &chapter {
             let stale = self.blocks.as_ref().is_none_or(|(p, s, _)| p != path || *s != stamp);
             if stale {
-                let text = std::fs::read_to_string(path).unwrap_or_else(|e| format!("無法讀取這一章：{e}"));
-                self.blocks = Some((path.clone(), stamp, novel::blocks(&text)));
+                let blocks = match std::fs::read_to_string(path) {
+                    Ok(text) => {
+                        // 反正都讀進來了，順便更新這一章的字數
+                        self.words.insert(path.clone(), WordStat { stamp, words: novel::word_count(&text) });
+                        novel::blocks(&text)
+                    }
+                    Err(e) => novel::blocks(&format!("無法讀取這一章：{e}")),
+                };
+                self.blocks = Some((path.clone(), stamp, blocks));
             }
         }
         let key = LayoutKey {
@@ -753,9 +999,9 @@ impl NovelView {
             }
         }
         let base_dir = chapter.as_deref().and_then(Path::parent).map(Path::to_path_buf).unwrap_or_default();
-        let blocks = match self.unit {
-            Unit::Front => toc_blocks(&self.book),
-            Unit::Chapter(_) => self.blocks.as_ref().map(|(_, _, b)| b.clone()).unwrap_or_default(),
+        let blocks: Cow<[NBlock]> = match self.unit {
+            Unit::Front => Cow::Owned(toc_blocks(&self.book)),
+            Unit::Chapter(_) => self.blocks.as_ref().map(|(_, _, b)| Cow::Borrowed(b.as_slice())).unwrap_or_default(),
         };
         let mut layout = ui.ctx().fonts_mut(|f| {
             let mut measure = |c: char, size: f32| {
@@ -778,6 +1024,80 @@ impl NovelView {
         self.layout = Some(Layout { key, lines: layout.lines, pages: layout.pages, line_len: layout.line_len });
         self.apply_want();
     }
+}
+
+/// 一章的字數，連同統計時檔案的修改時間（檔案改過才需要重算）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WordStat {
+    stamp: Option<SystemTime>,
+    words: usize,
+}
+
+/// 加上千分位：`1234567` → `1,234,567`。
+fn group_digits(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// 側邊目錄的一列。
+#[derive(Default)]
+struct TocRow<'a> {
+    text: &'a str,
+    /// 右側的淡色資訊（字數）
+    trailing: Option<String>,
+    selected: bool,
+    indent: f32,
+    /// 卷的標題列：展開／收合的箭頭
+    chevron: Option<bool>,
+    strong: bool,
+}
+
+fn toc_row(ui: &mut Ui, pal: &Palette, row: TocRow) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return resp;
+    }
+    let p = ui.painter();
+    if row.selected {
+        p.rect_filled(rect, 6.0, pal.selected);
+        let bar = Rect::from_min_size(rect.min + vec2(0.0, 6.0), vec2(3.0, rect.height() - 12.0));
+        p.rect_filled(bar, 1.5, pal.accent);
+    } else if resp.is_pointer_button_down_on() {
+        p.rect_filled(rect, 6.0, pal.selected);
+    } else if resp.hovered() {
+        p.rect_filled(rect, 6.0, pal.hover);
+    }
+    let cy = rect.center().y;
+    let mut x = rect.left() + 8.0 + row.indent;
+    if let Some(open) = row.chevron {
+        let r = Rect::from_center_size(pos2(x + 4.0, cy), vec2(10.0, 10.0));
+        icons::paint(p, r, if open { Icon::ChevronDown } else { Icon::ChevronRight }, pal.weak);
+        x += 16.0;
+    }
+    let mut right = rect.right() - 8.0;
+    if let Some(t) = row.trailing {
+        let galley = p.layout_no_wrap(t, FontId::proportional(11.5), pal.weak);
+        right -= galley.size().x;
+        p.galley(pos2(right, cy - galley.size().y / 2.0), galley, pal.weak);
+        right -= 8.0;
+    }
+    let text = if row.strong { RichText::new(row.text).strong() } else { RichText::new(row.text) };
+    let color = if row.selected || row.strong { pal.ink } else { ui.visuals().text_color() };
+    let galley = egui::WidgetText::from(text).into_galley(
+        ui,
+        Some(TextWrapMode::Truncate),
+        (right - x).max(10.0),
+        egui::TextStyle::Body,
+    );
+    p.galley(pos2(x, cy - galley.size().y / 2.0), galley, color);
+    resp
 }
 
 /// 目錄頁的內容：書名、各卷與各章（每一章一行，可點）。
@@ -1398,9 +1718,209 @@ fn rotated(p: &egui::Painter, text: &str, center: egui::Pos2, size: f32, color: 
     p.add(Shape::Text(shape));
 }
 
+/// 把這一幀的滾輪量加進累積量 `acc`（單位：頁），回傳現在要翻幾頁（負值往後翻，正值往回翻）。
+///
+/// `lines` 是滑鼠滾輪的格數：一格一頁，同一幀滾了幾格就翻幾頁。
+/// `points` 是觸控板回報的點數：一次滑動會送出很多點數（還有慣性），所以一次最多翻一頁。
+fn wheel_pages(acc: &mut f32, lines: f32, points: f32) -> i32 {
+    *acc += lines + points / WHEEL_POINTS_PER_PAGE;
+    if lines != 0.0 {
+        let pages = acc.trunc();
+        *acc -= pages;
+        pages as i32
+    } else if acc.abs() >= 1.0 {
+        let pages = acc.signum() as i32;
+        *acc = 0.0;
+        pages
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn digits() {
+        assert_eq!(group_digits(0), "0");
+        assert_eq!(group_digits(999), "999");
+        assert_eq!(group_digits(1000), "1,000");
+        assert_eq!(group_digits(1234567), "1,234,567");
+    }
+
+    fn chapter(name: &str, volume: Option<&str>) -> novel::NovelChapter {
+        novel::NovelChapter { path: PathBuf::from(name), title: name.into(), volume: volume.map(str::to_string) }
+    }
+
+    fn view(chapters: Vec<novel::NovelChapter>, words: &[usize]) -> NovelView {
+        let book =
+            NovelBook { root: PathBuf::from("."), title: "書".into(), author: String::new(), cover: None, chapters };
+        let mut v = NovelView::open(book, None);
+        for (c, w) in v.book.chapters.iter().zip(words) {
+            v.words.insert(c.path.clone(), WordStat { stamp: None, words: *w });
+        }
+        v
+    }
+
+    #[test]
+    fn volumes_and_word_totals() {
+        let chapters = vec![
+            chapter("序", None),
+            chapter("一之一", Some("第一卷")),
+            chapter("一之二", Some("第一卷")),
+            chapter("二之一", Some("第二卷")),
+        ];
+        let mut v = view(chapters, &[100, 2000, 3000]);
+        assert_eq!(v.volume_range(0), 0..1);
+        assert_eq!(v.volume_range(1), 1..3);
+        assert_eq!(v.volume_range(2), 1..3);
+        assert_eq!(v.volume_range(3), 3..4);
+        assert_eq!(v.words_in(v.volume_range(2)), Some(5000));
+        // 第二卷還沒統計完：整卷與全書都還不知道
+        assert_eq!(v.words_in(v.volume_range(3)), None);
+        assert_eq!(v.total_words(), None);
+
+        v.words.insert(PathBuf::from("二之一"), WordStat { stamp: None, words: 4900 });
+        assert_eq!(v.total_words(), Some(10_000));
+
+        // 進度依字數：讀完第一卷第二章（單頁的章）= (100 + 2000 + 3000) / 10000
+        v.unit = Unit::Chapter(2);
+        assert!((v.progress() - 0.51).abs() < 1e-6, "{}", v.progress());
+        v.unit = Unit::Chapter(3);
+        assert_eq!(v.progress(), 1.0);
+    }
+
+    #[test]
+    fn chapter_jumps_follow_volumes() {
+        let chapters = vec![chapter("一之一", Some("第一卷")), chapter("二之一", Some("第二卷"))];
+        let mut v = view(chapters, &[]);
+        v.collapsed.insert("第二卷".into());
+        v.next_chapter();
+        assert_eq!(v.unit, Unit::Chapter(0));
+        v.next_chapter();
+        assert_eq!(v.unit, Unit::Chapter(1));
+        assert!(!v.collapsed.contains("第二卷"), "moving into a collapsed volume expands it");
+        v.next_chapter();
+        assert_eq!(v.unit, Unit::Chapter(1), "stays on the last chapter");
+        assert!(v.end_flash.is_some());
+        v.prev_chapter();
+        assert_eq!(v.unit, Unit::Chapter(0));
+        v.prev_chapter();
+        assert_eq!(v.unit, Unit::Front);
+    }
+
+    /// End to end, headless: the background count finishes, and the whole view
+    /// (pages, side table of contents, status text) renders with the totals.
+    #[test]
+    fn counts_words_in_background() {
+        let dir = std::env::temp_dir().join(format!("shosai-novel-view-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("v1")).unwrap();
+        let texts = [
+            (
+                "a.md",
+                "# A
+
+hello world again
+",
+            ),
+            (
+                "v1/b.md",
+                "# B
+
+one two
+",
+            ),
+            (
+                "v1/c.md",
+                "# C
+
+three
+",
+            ),
+        ];
+        for (name, text) in texts {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        let expected: usize = texts.iter().map(|(_, t)| novel::word_count(t)).sum();
+        let lib = shosai_core::Library::open(&dir).unwrap();
+        let mut v = NovelView::open(NovelBook::new(&dir, &lib.entries, None), None);
+        v.show_toc = true;
+        assert_eq!(v.total_words(), None);
+
+        let ctx = egui::Context::default();
+        let pal = crate::theme::palette(false);
+        let prefs = NovelPrefs::default();
+        let frame = |v: &mut NovelView| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1100.0, 700.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| v.show(ui, &pal, &prefs, &mut Vec::new()));
+            out.textures_delta.clear();
+        };
+        for _ in 0..400 {
+            frame(&mut v);
+            if v.words_rx.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(v.words_rx.is_none(), "the counting thread finished");
+        assert_eq!(v.total_words(), Some(expected));
+        assert!(v.status().1.contains(&format!("{} 字", group_digits(expected))), "{}", v.status().1);
+
+        // into the first chapter of the sub-folder: chapter, volume and book totals all show
+        let i = v.book.chapters.iter().position(|c| c.volume.is_some()).unwrap();
+        v.go(Unit::Chapter(i), Want::First);
+        frame(&mut v);
+        let status = v.status().1;
+        let volume = v.words_in(v.volume_range(i)).unwrap();
+        assert_eq!(v.volume_range(i).len(), 2);
+        assert!(status.contains("本章") && status.contains(&format!("本卷 {volume} 字")), "{status}");
+
+        // a chapter edited on disk is recounted
+        let path = v.book.chapters[i].path.clone();
+        std::fs::write(
+            &path,
+            "# B
+
+one two three four five six
+",
+        )
+        .unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(later).unwrap();
+        v.files_changed();
+        for _ in 0..400 {
+            frame(&mut v);
+            if v.words_rx.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(v.total_words(), Some(expected + 4));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn wheel() {
+        // 滑鼠滾輪：一格就翻一頁
+        let mut acc = 0.0;
+        assert_eq!(wheel_pages(&mut acc, -1.0, 0.0), -1);
+        assert_eq!(wheel_pages(&mut acc, -1.0, 0.0), -1);
+        assert_eq!(wheel_pages(&mut acc, 3.0, 0.0), 3);
+        assert_eq!(acc, 0.0);
+        // 高解析度滾輪：半格半格累積
+        assert_eq!(wheel_pages(&mut acc, -0.5, 0.0), 0);
+        assert_eq!(wheel_pages(&mut acc, -0.5, 0.0), -1);
+        // 觸控板：累積到門檻才翻，而且一次只翻一頁
+        assert_eq!(wheel_pages(&mut acc, 0.0, -50.0), 0);
+        assert_eq!(wheel_pages(&mut acc, 0.0, -50.0), 0);
+        assert_eq!(wheel_pages(&mut acc, 0.0, -900.0), -1);
+        assert_eq!(acc, 0.0);
+    }
 
     fn measure(c: char, size: f32) -> f32 {
         if is_wide(c) {
