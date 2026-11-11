@@ -78,9 +78,13 @@ const HEAD: u8 = 8;
 /// 觸控板（以點數回報的捲動）滑多少點翻一頁
 const WHEEL_POINTS_PER_PAGE: f32 = 120.0;
 /// 翻頁動畫的長度（秒）
-const TURN_SECS: f64 = 0.28;
-/// 距離上一次翻頁不到這麼久又翻（秒）：直接換頁，不播動畫，連續快翻才跟得上手
-const TURN_RAPID_SECS: f64 = 0.4;
+const TURN_SECS: f64 = 0.45;
+/// 連續快翻時用的短動畫（秒）
+const TURN_FAST_SECS: f64 = 0.14;
+/// 距離上一次翻頁不到這麼久又翻（秒），就算是連續快翻
+const TURN_RAPID_SECS: f64 = 0.55;
+/// 兩次翻頁近到這個程度（秒）連短動畫都來不及看：直接換頁
+const TURN_SNAP_SECS: f64 = 0.06;
 
 #[derive(Debug, Clone, PartialEq)]
 enum Kind {
@@ -189,6 +193,8 @@ struct Turn {
     from: View,
     forward: bool,
     spread: bool,
+    /// 動畫全長（秒）：平常慢慢翻，連續快翻時用短的
+    secs: f64,
     /// 開始的時間與要翻到哪裡。第一次畫的時候才定：新的一章排版花的時間不算進動畫裡
     start: Option<(f64, (Unit, usize))>,
 }
@@ -409,10 +415,26 @@ impl NovelView {
         if (self.unit, self.page) == before {
             return;
         }
-        // 連續快翻（按住按鍵、滾輪連轉）時直接換頁：動畫還沒播完又要翻，只會拖慢
-        let animate = self.animate && !self.hurry && self.now - self.turned_at > TURN_RAPID_SECS;
+        let gap = self.now - self.turned_at;
         self.turned_at = self.now;
-        self.turn = from.filter(|_| animate).map(|from| Turn { from, forward, spread, start: None });
+        // 這一幀已經翻過一次、畫面還沒更新（滾輪一次滾了好幾格）：
+        // 合併成一次動畫，從畫面上真正看到的那一面翻起
+        let pending = self.turn.take().filter(|t| t.start.is_none() && t.forward == forward).map(|t| t.from);
+        let secs = if !self.animate || self.hurry {
+            // 按住按鍵時系統一秒送來幾十下，直接換頁才跟得上
+            None
+        } else if pending.is_some() {
+            Some(TURN_FAST_SECS)
+        } else if gap < TURN_SNAP_SECS {
+            None
+        } else if gap < TURN_RAPID_SECS {
+            // 連續快翻（滾輪連轉、連按）：改用短動畫，看得出在翻又不拖慢。
+            // 上一頁的動畫還沒播完就直接結束，換這一頁的
+            Some(TURN_FAST_SECS)
+        } else {
+            Some(TURN_SECS)
+        };
+        self.turn = pending.or(from).zip(secs).map(|(from, secs)| Turn { from, forward, spread, secs, start: None });
     }
 
     fn step_forward(&mut self, spread: bool) {
@@ -811,8 +833,9 @@ impl NovelView {
         let (now, dt) = ui.input(|i| (i.time, f64::from(i.predicted_dt)));
         let at = (here.unit, here.page);
         // 第一幀就要看得到動靜，所以從「已經過了一幀」算起
-        let (start, to) = *turn.start.get_or_insert((now - dt.min(TURN_SECS / 4.0), at));
-        let t = ((now - start) / TURN_SECS) as f32;
+        let (secs, fast) = (turn.secs, turn.secs < TURN_SECS);
+        let (start, to) = *turn.start.get_or_insert((now - dt.min(secs / 4.0), at));
+        let t = ((now - start) / secs) as f32;
         let (old, new) = (&turn.from.layout.key, &here.layout.key);
         // 中途跳到別處、按了滑鼠、版面變了（視窗大小、字級、單雙頁）：直接結束
         let stale = to != at || turn.spread != spread || old.grid != new.grid || old.prefs != new.prefs;
@@ -820,8 +843,9 @@ impl NovelView {
             self.turn = None;
             return None;
         }
-        // 一開始快、收尾慢：按下去馬上有反應，落下時不突兀
-        Some(1.0 - (1.0 - t).powi(3))
+        // 一開始快、收尾慢：按下去馬上有反應，落下時不突兀。
+        // 短動畫收得更急，在下一頁翻過來之前就幾乎到位了
+        Some(1.0 - (1.0 - t).powi(if fast { 3 } else { 2 }))
     }
 
     /// 把 `view` 的第 `idx` 頁畫在 `rect`（紙張另外畫）。超過最後一頁就是空白頁。
@@ -2132,7 +2156,7 @@ one two three four five six
             std::fs::create_dir_all(&dir).unwrap();
             for (file, title) in [("1.md", "第一章　出發"), ("2.md", "第二章　歸途")] {
                 let mut text = format!("# {title}\n\n");
-                for i in 0..40 {
+                for i in 0..90 {
                     text.push_str(&"那一天的雨下得很久，他在窗邊等了一個下午。".repeat(2 + i % 4));
                     text.push_str("「還要多久？」她問，手裡的茶已經涼了。\n\n");
                 }
@@ -2206,8 +2230,25 @@ one two three four five six
             self.frame(1.0 / 60.0, vec![event]);
         }
 
+        /// 滑鼠在頁面上，滾輪往下滾 `notches` 格（同一幀內）。
+        fn wheel(&mut self, notches: f32) {
+            let wheel = egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: vec2(0.0, -notches),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
+                modifiers: egui::Modifiers::NONE,
+            };
+            self.frame(1.0 / 60.0, vec![egui::Event::PointerMoved(STAGE.to_pos2() / 2.0), wheel]);
+        }
+
         fn at(&self) -> (Unit, usize) {
             (self.v.unit, self.v.page)
+        }
+
+        /// 正在播的翻頁動畫全長幾秒（沒有在播就是 `None`）。
+        fn turning(&self) -> Option<f64> {
+            self.v.turn.as_ref().map(|t| t.secs)
         }
 
         fn save(&self, name: &str) {
@@ -2261,15 +2302,42 @@ one two three four five six
     }
 
     #[test]
-    fn rapid_turns_skip_the_animation() {
+    fn rapid_turns_use_the_short_animation() {
         let mut s = Stage::new("rapid");
-        // 動畫還在播又翻：直接換頁
-        s.press(Key::ArrowLeft);
-        assert!(s.v.turn.is_some());
-        s.frame(0.1, Vec::new());
-        s.press(Key::ArrowLeft);
+        // 慢慢翻：完整的動畫
+        s.wheel(1.0);
+        assert_eq!(s.at(), (Unit::Chapter(0), 2));
+        assert_eq!(s.turning(), Some(TURN_SECS));
+        // 動畫還在播又滾一格：上一頁直接到位，這一頁改用短動畫
+        s.frame(0.15, Vec::new());
+        s.wheel(1.0);
         assert_eq!(s.at(), (Unit::Chapter(0), 4));
-        assert!(s.v.turn.is_none(), "the second turn snaps");
+        assert_eq!(s.turning(), Some(TURN_FAST_SECS));
+        assert_eq!(s.v.turn.as_ref().unwrap().from.page, 2, "starts from the page the last turn was heading to");
+        // 繼續連轉：每一格都是短動畫，而且在下一格來之前就播完了
+        for page in [6, 8, 10] {
+            s.frame(0.15, Vec::new());
+            assert!(s.v.turn.is_none(), "the short animation is over before the next notch");
+            s.wheel(1.0);
+            assert_eq!(s.at(), (Unit::Chapter(0), page));
+            assert_eq!(s.turning(), Some(TURN_FAST_SECS));
+        }
+        // 一幀裡滾了兩格：翻兩面，合併成一次短動畫，從畫面上原本那一面翻起
+        s.frame(1.0, Vec::new());
+        s.wheel(2.0);
+        assert_eq!(s.at(), (Unit::Chapter(0), 14));
+        assert_eq!(s.turning(), Some(TURN_FAST_SECS));
+        assert_eq!(s.v.turn.as_ref().unwrap().from.page, 10);
+        // 滾得比畫面更新還快：來不及看，直接換頁
+        s.wheel(1.0);
+        assert_eq!(s.at(), (Unit::Chapter(0), 16));
+        assert!(s.v.turn.is_none(), "turns one frame apart snap");
+        s.settle();
+        // 停下來之後再翻，又是完整的動畫
+        s.frame(1.0, Vec::new());
+        s.wheel(-1.0);
+        assert_eq!(s.at(), (Unit::Chapter(0), 14));
+        assert_eq!(s.turning(), Some(TURN_SECS));
         s.settle();
 
         // 按住按鍵：第一下有動畫，之後系統送來的重複按鍵每一下都直接換頁，
@@ -2279,7 +2347,7 @@ one two three four five six
         assert!(s.v.turn.is_some());
         s.frame(1.0, Vec::new());
         s.hold(Key::ArrowLeft);
-        assert_eq!(s.at(), (Unit::Chapter(0), 8));
+        assert_eq!(s.at(), (Unit::Chapter(0), 18));
         assert!(s.v.turn.is_none(), "a key repeat snaps");
         s.key(Key::ArrowLeft, false);
 
