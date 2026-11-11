@@ -2564,6 +2564,7 @@ impl ShosaiApp {
                     }
                 });
                 ui.checkbox(&mut nv.para_gap, "段落之間空半行");
+                ui.checkbox(&mut nv.turn_anim, "翻頁動畫");
                 hint(ui, "注音寫法：｜漢字《かんじ》。*強調* 會顯示成著重號，--- 或 ◇◇◇ 為場景分隔，單獨一行的圖片會成為插圖頁。");
                 ui.horizontal(|ui| {
                     ui.label(format!("已記住 {} 本書的閱讀位置", st.novel_pos.len()));

@@ -18,6 +18,8 @@ mod md_view;
 mod novel_view;
 mod pdf_view;
 mod scroll_map;
+#[cfg(test)]
+mod shot;
 mod theme;
 mod tree;
 

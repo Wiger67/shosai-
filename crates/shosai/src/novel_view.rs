@@ -6,18 +6,20 @@
 //! - 注音（`｜漢字《かんじ》`）、著重號（`*強調*`）、直排時兩位數字橫向並排（縱中橫）
 //! - 記住每本書讀到的位置（以字數記錄，改變字級或視窗大小也不會跑掉）
 //! - 子資料夾是「卷」：目錄依卷分組、可收合，並統計每章、每卷與全書的字數
+//! - 翻頁動畫：翻動的那張紙沿直線對摺過去，只用平移和裁切，不需要另外的貼圖
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::f32::consts::FRAC_PI_2;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::mpsc::{channel, Receiver};
 use std::time::SystemTime;
 
 use eframe::egui::{
-    self, pos2, vec2, Align, Align2, Color32, CursorIcon, FontId, Key, Rect, RichText, Sense, Shape, Stroke,
-    TextWrapMode, Ui,
+    self, pos2, vec2, Align, Align2, Color32, CursorIcon, FontId, Key, Rangef, Rect, RichText, Sense, Shape, Stroke,
+    TextWrapMode, Ui, Vec2,
 };
 use serde::{Deserialize, Serialize};
 use shosai_core::novel::{self, NBlock, NovelBook, Span};
@@ -42,11 +44,21 @@ pub struct NovelPrefs {
     pub indent: u8,
     /// 段落之間空半行
     pub para_gap: bool,
+    /// 翻頁時播放翻頁動畫
+    pub turn_anim: bool,
 }
 
 impl Default for NovelPrefs {
     fn default() -> Self {
-        Self { vertical: true, spread: true, font_size: 18.0, line_spacing: 1.8, indent: 2, para_gap: false }
+        Self {
+            vertical: true,
+            spread: true,
+            font_size: 18.0,
+            line_spacing: 1.8,
+            indent: 2,
+            para_gap: false,
+            turn_anim: true,
+        }
     }
 }
 
@@ -65,6 +77,10 @@ const WEAK: u8 = 4;
 const HEAD: u8 = 8;
 /// 觸控板（以點數回報的捲動）滑多少點翻一頁
 const WHEEL_POINTS_PER_PAGE: f32 = 120.0;
+/// 翻頁動畫的長度（秒）
+const TURN_SECS: f64 = 0.28;
+/// 距離上一次翻頁不到這麼久又翻（秒）：直接換頁，不播動畫，連續快翻才跟得上手
+const TURN_RAPID_SECS: f64 = 0.4;
 
 #[derive(Debug, Clone, PartialEq)]
 enum Kind {
@@ -159,13 +175,56 @@ struct Layout {
     line_len: f32,
 }
 
+/// 畫面上攤開的一面：哪一份排版的第幾頁（雙頁時是兩頁中的第一頁）。
+#[derive(Clone)]
+struct View {
+    layout: Rc<Layout>,
+    unit: Unit,
+    page: usize,
+}
+
+/// 進行中的翻頁動畫。
+struct Turn {
+    /// 翻頁之前的那一面
+    from: View,
+    forward: bool,
+    spread: bool,
+    /// 開始的時間與要翻到哪裡。第一次畫的時候才定：新的一章排版花的時間不算進動畫裡
+    start: Option<(f64, (Unit, usize))>,
+}
+
+/// 畫頁面時共用的東西。
+struct Draw<'a> {
+    p: egui::Painter,
+    prefs: &'a NovelPrefs,
+    pal: &'a Palette,
+    margin: Vec2,
+    content: Vec2,
+    spread: bool,
+    dark: bool,
+}
+
+impl Draw<'_> {
+    /// 只畫在 `clip` 範圍內。
+    fn clipped(&self, clip: Rect) -> Draw<'_> {
+        Draw { p: self.p.with_clip_rect(clip), ..*self }
+    }
+}
+
 /// 書本模式的檢視器。
 pub struct NovelView {
     pub book: NovelBook,
     unit: Unit,
     page: usize,
     want: Want,
-    layout: Option<Layout>,
+    layout: Option<Rc<Layout>>,
+    turn: Option<Turn>,
+    /// 這一幀的時間、上一次翻頁的時間
+    now: f64,
+    turned_at: f64,
+    /// 要不要播翻頁動畫（設定），以及這一幀是不是按住按鍵連續翻（不播）
+    animate: bool,
+    hurry: bool,
     /// 目前這一章的內容（路徑、修改時間、段落）
     blocks: Option<(PathBuf, Option<SystemTime>, Vec<NBlock>)>,
     pub show_toc: bool,
@@ -200,6 +259,11 @@ impl NovelView {
             page: 0,
             want,
             layout: None,
+            turn: None,
+            now: 0.0,
+            turned_at: f64::NEG_INFINITY,
+            animate: true,
+            hurry: false,
             blocks: None,
             show_toc: false,
             toc_scroll: Some(Some(Align::Center)),
@@ -326,6 +390,32 @@ impl NovelView {
     }
 
     fn next_page(&mut self, spread: bool) {
+        self.turn_page(spread, true);
+    }
+
+    fn prev_page(&mut self, spread: bool) {
+        self.turn_page(spread, false);
+    }
+
+    /// 翻一頁，並視情況開始翻頁動畫。
+    fn turn_page(&mut self, spread: bool, forward: bool) {
+        let before = (self.unit, self.page);
+        let from = self.layout.clone().map(|layout| View { layout, unit: self.unit, page: self.page });
+        if forward {
+            self.step_forward(spread);
+        } else {
+            self.step_back(spread);
+        }
+        if (self.unit, self.page) == before {
+            return;
+        }
+        // 連續快翻（按住按鍵、滾輪連轉）時直接換頁：動畫還沒播完又要翻，只會拖慢
+        let animate = self.animate && !self.hurry && self.now - self.turned_at > TURN_RAPID_SECS;
+        self.turned_at = self.now;
+        self.turn = from.filter(|_| animate).map(|from| Turn { from, forward, spread, start: None });
+    }
+
+    fn step_forward(&mut self, spread: bool) {
         let n = self.layout.as_ref().map(|l| l.pages.len()).unwrap_or(0);
         if self.page + self.step(spread) < n {
             self.page += self.step(spread);
@@ -341,7 +431,7 @@ impl NovelView {
         }
     }
 
-    fn prev_page(&mut self, spread: bool) {
+    fn step_back(&mut self, spread: bool) {
         if self.page >= self.step(spread) {
             self.page -= self.step(spread);
             return;
@@ -545,6 +635,7 @@ impl NovelView {
                 }
             });
             ui.checkbox(&mut prefs.para_gap, "段落之間空半行");
+            ui.checkbox(&mut prefs.turn_anim, "翻頁動畫");
         });
         if icons::button(ui, Icon::Plus, "放大字級（Ctrl+=）").clicked() {
             prefs.font_size = (prefs.font_size + 1.0).min(32.0);
@@ -558,6 +649,8 @@ impl NovelView {
     // 主畫面
 
     pub fn show(&mut self, ui: &mut Ui, pal: &Palette, prefs: &NovelPrefs, events: &mut Vec<NovelEvent>) {
+        self.now = ui.input(|i| i.time);
+        self.animate = prefs.turn_anim;
         self.poll_words();
         if std::mem::take(&mut self.recount) {
             self.start_count(ui.ctx());
@@ -597,68 +690,52 @@ impl NovelView {
             self.page &= !1;
         }
 
-        // 輸入
+        // 輸入（按住按鍵連續翻頁時不播動畫）
+        self.hurry = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { repeat: true, .. })));
         self.input(ui, &resp, prefs, spread, events);
-        let Some(layout) = &self.layout else { return };
-        let n = layout.pages.len();
-
-        // 頁面（直排由右至左：第一頁在右）
-        let mut slots: Vec<(Rect, usize)> = Vec::new();
-        let first = Rect::from_min_size(top_left, page_size);
-        if spread {
-            let second = first.translate(vec2(page_w + gutter, 0.0));
-            let (a, b) = if prefs.vertical { (second, first) } else { (first, second) };
-            slots.push((a, self.page));
-            if self.page + 1 < n {
-                slots.push((b, self.page + 1));
-            } else {
-                paint_blank(ui, b, pal);
+        self.hurry = false;
+        if self.layout.is_none() {
+            // 翻到另一章了：馬上排版，這一幀就畫得出新的一頁（翻頁動畫也要用）
+            self.ensure_layout(ui, content, prefs);
+            if spread {
+                self.page &= !1;
             }
-        } else {
-            slots.push((first, self.page));
+        }
+        let Some(layout) = self.layout.clone() else { return };
+        let here = View { layout, unit: self.unit, page: self.page };
+
+        // 頁面（直排由右至左：第一頁在右）。`far` 放第一頁，`near` 放第二頁（翻動的那一張）
+        let first = Rect::from_min_size(top_left, page_size);
+        let second = first.translate(vec2(page_w + gutter, 0.0));
+        let (far, near) = match (spread, prefs.vertical) {
+            (false, _) => (first, None),
+            (true, true) => (second, Some(first)),
+            (true, false) => (first, Some(second)),
+        };
+        let draw = Draw { p: ui.painter().clone(), prefs, pal, margin, content, spread, dark: ui.visuals().dark_mode };
+        paint_paper(&draw, far);
+        if let Some(near) = near {
+            paint_paper(&draw, near);
         }
         let mut links: Vec<(Rect, usize)> = Vec::new();
-        for (rect, idx) in &slots {
-            let Some(page) = layout.pages.get(*idx) else { continue };
-            paint_paper(ui, *rect, pal);
-            let inner = Rect::from_min_size(rect.min + margin, content);
-            match page {
-                Page::Cover => self.paint_cover(ui, *rect, pal),
-                Page::Image { path, alt } => paint_image(ui, inner, path, alt, &self.images, pal),
-                Page::Text(lines) => {
-                    paint_text(ui, inner, layout, lines, prefs, pal, &mut links);
+        let turning = self.turn_progress(ui, &here, spread, resp.clicked());
+        match (turning, &self.turn) {
+            (Some(t), Some(turn)) => {
+                // a 是前面的那一面，b 是後面的那一面；往回翻就是同一段動畫倒著播
+                let (a, b, tau) = if turn.forward { (&turn.from, &here, t) } else { (&here, &turn.from, 1.0 - t) };
+                self.paint_turn(&draw, far, near, a, b, tau);
+            }
+            _ => {
+                self.paint_page(&draw, far, &here, here.page, &mut links);
+                if let Some(near) = near {
+                    self.paint_page(&draw, near, &here, here.page + 1, &mut links);
                 }
             }
-            // 頁首（書名 / 章名）與頁碼
-            if !matches!(page, Page::Cover) {
-                let small = FontId::proportional((prefs.font_size * 0.62).clamp(10.0, 13.0));
-                let head = match self.unit {
-                    Unit::Front => "目　錄".to_string(),
-                    Unit::Chapter(i) => self.book.chapters[i].title.clone(),
-                };
-                // 雙頁時：一邊印書名、另一邊印章名（像實體書的書眉）
-                let head = if !spread || (*idx % 2 == 1) == !prefs.vertical { head } else { self.book.title.clone() };
-                let p = ui.painter();
-                p.text(
-                    pos2(rect.center().x, rect.top() + margin.y * 0.5),
-                    Align2::CENTER_CENTER,
-                    head,
-                    small.clone(),
-                    pal.weak,
-                );
-                p.text(
-                    pos2(rect.center().x, rect.bottom() - margin.y * 0.5),
-                    Align2::CENTER_CENTER,
-                    format!("{}", idx + 1),
-                    small,
-                    pal.weak,
-                );
-            }
         }
-        if spread && slots.len() == 2 {
+        if spread {
             // 書脊的陰影
             let x = first.right();
-            let shade = Color32::from_black_alpha(if ui.visuals().dark_mode { 60 } else { 22 });
+            let shade = Color32::from_black_alpha(if draw.dark { 60 } else { 22 });
             for i in 0..8 {
                 let a = shade.gamma_multiply(1.0 - i as f32 / 8.0);
                 ui.painter().vline(x - i as f32, first.y_range(), Stroke::new(1.0, a));
@@ -721,6 +798,124 @@ impl NovelView {
                     self.show_toc = !self.show_toc;
                 }
             }
+        }
+        if self.turn.is_some() {
+            // 只有動畫播放中才連續重畫；播完就停
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// 翻頁動畫播到哪了（0–1，已經套用緩動）。沒有在播、播完了、或該中止時回傳 `None`。
+    fn turn_progress(&mut self, ui: &Ui, here: &View, spread: bool, interrupt: bool) -> Option<f32> {
+        let turn = self.turn.as_mut()?;
+        let (now, dt) = ui.input(|i| (i.time, f64::from(i.predicted_dt)));
+        let at = (here.unit, here.page);
+        // 第一幀就要看得到動靜，所以從「已經過了一幀」算起
+        let (start, to) = *turn.start.get_or_insert((now - dt.min(TURN_SECS / 4.0), at));
+        let t = ((now - start) / TURN_SECS) as f32;
+        let (old, new) = (&turn.from.layout.key, &here.layout.key);
+        // 中途跳到別處、按了滑鼠、版面變了（視窗大小、字級、單雙頁）：直接結束
+        let stale = to != at || turn.spread != spread || old.grid != new.grid || old.prefs != new.prefs;
+        if t >= 1.0 || interrupt || stale {
+            self.turn = None;
+            return None;
+        }
+        // 一開始快、收尾慢：按下去馬上有反應，落下時不突兀
+        Some(1.0 - (1.0 - t).powi(3))
+    }
+
+    /// 把 `view` 的第 `idx` 頁畫在 `rect`（紙張另外畫）。超過最後一頁就是空白頁。
+    fn paint_page(&self, d: &Draw, rect: Rect, view: &View, idx: usize, links: &mut Vec<(Rect, usize)>) {
+        let Some(page) = view.layout.pages.get(idx) else { return };
+        let inner = Rect::from_min_size(rect.min + d.margin, d.content);
+        match page {
+            Page::Cover => self.paint_cover(d, rect),
+            Page::Image { path, alt } => paint_image(d, inner, path, alt, &self.images),
+            Page::Text(lines) => paint_text(d, inner, &view.layout, lines, links),
+        }
+        // 頁首（書名 / 章名）與頁碼
+        if matches!(page, Page::Cover) {
+            return;
+        }
+        // 雙頁時：一邊印書名、另一邊印章名（像實體書的書眉）
+        let head = if d.spread && (idx % 2 == 1) == d.prefs.vertical {
+            self.book.title.as_str()
+        } else {
+            match view.unit {
+                Unit::Front => "目　錄",
+                Unit::Chapter(i) => self.book.chapters.get(i).map_or("", |c| c.title.as_str()),
+            }
+        };
+        let small = FontId::proportional((d.prefs.font_size * 0.62).clamp(10.0, 13.0));
+        let x = rect.center().x;
+        d.p.text(pos2(x, rect.top() + d.margin.y * 0.5), Align2::CENTER_CENTER, head, small.clone(), d.pal.weak);
+        d.p.text(pos2(x, rect.bottom() - d.margin.y * 0.5), Align2::CENTER_CENTER, idx + 1, small, d.pal.weak);
+    }
+
+    /// 翻頁途中的畫面。`a` 是前面的那一面、`b` 是後面的那一面，
+    /// `tau` 是翻過去多少（0 = 還是 a，1 = 已經是 b）。
+    ///
+    /// 把翻動的那張紙當成沿著一條直線對摺：摺線從書口往裝訂邊移動，摺過去的那一段蓋在對面，
+    /// 露出紙的背面（b 的第一頁），摺線後方露出底下的新頁（b 的第二頁）。
+    /// 畫面上的每一塊都只是「某一頁平移之後裁切」，文字不必縮放變形，也不需要先畫到貼圖上，
+    /// 所以動畫中每一幀要畫的字和平常差不多。
+    fn paint_turn(&self, d: &Draw, far: Rect, near: Option<Rect>, a: &View, b: &View, tau: f32) {
+        let mut none = Vec::new();
+        // 翻動的那張紙：書口（自由邊）在 edge，裝訂邊在 hinge。單頁時裝訂邊就是頁面的另一側
+        let leaf = near.unwrap_or(far);
+        let (edge, hinge) = if d.prefs.vertical { (leaf.left(), leaf.right()) } else { (leaf.right(), leaf.left()) };
+        let dir = (hinge - edge).signum();
+        // 對齊實體像素：平移量帶小數的話，字會在動畫中一格一格地抖
+        let ppp = d.p.pixels_per_point();
+        let fold = ((edge + (hinge - edge) * tau.clamp(0.0, 1.0)) * ppp).round() / ppp;
+        // 摺過去那一段的自由邊現在在哪；過了一半就會越過裝訂邊
+        let tip = 2.0 * fold - edge;
+        let beyond = (tip - hinge) * dir > 0.0;
+        let y = leaf.y_range();
+        let span = |x0: f32, x1: f32| Rect::from_x_y_ranges(x0.min(x1)..=x0.max(x1), y);
+        // 雙頁時翻動的是每一面的第二頁
+        let second = usize::from(near.is_some());
+
+        // 摺線後方：底下露出來的新頁
+        self.paint_page(&d.clipped(span(edge, fold)), leaf, b, b.page + second, &mut none);
+        // 還平放著、也還沒被蓋住的部分
+        if !beyond {
+            self.paint_page(&d.clipped(span(tip, hinge)), leaf, a, a.page + second, &mut none);
+        }
+        // 對面那一頁：沒被蓋住的部分
+        if near.is_some() {
+            let outer = 2.0 * hinge - edge;
+            self.paint_page(&d.clipped(span(if beyond { tip } else { hinge }, outer)), far, a, a.page, &mut none);
+        }
+        // 摺過去的那一段：紙的背面。雙頁時就是 b 的第一頁，從它最後的位置平移過來
+        let flap = span(fold, if near.is_none() && beyond { hinge } else { tip });
+        let on_flap = d.clipped(flap);
+        // 紙翻得多高：頭尾都是 0，所以動畫開始和結束時畫面不會突然跳一下
+        let rise = (tau * std::f32::consts::PI).sin().max(0.0);
+        if near.is_some() {
+            // 深色的紙上影子不明顯，讓翻起來的那一段稍微亮一點（離光比較近）
+            let lit = if d.dark { 0.05 * rise } else { 0.0 };
+            on_flap.p.rect_filled(flap, 0.0, d.pal.paper.lerp_to_gamma(Color32::WHITE, lit));
+            self.paint_page(&on_flap, far.translate(vec2(2.0 * (fold - hinge), 0.0)), b, b.page, &mut none);
+        } else {
+            // 單頁：背面留白，顏色比紙面暗一點
+            on_flap.p.rect_filled(flap, 0.0, d.pal.paper.lerp_to_gamma(d.pal.desk, 0.45));
+        }
+
+        // 影子：紙翻得越高越深
+        let lift = rise * if d.dark { 2.0 } else { 1.0 };
+        let shadow = |alpha: f32| Color32::from_black_alpha((alpha * lift).min(160.0) as u8);
+        let book = d.clipped(far.union(leaf));
+        // 翻起來的紙落在新頁上的影子
+        shade(&book.p, fold, fold - dir * 40.0, y, shadow(46.0), Color32::TRANSPARENT);
+        // 摺過去的那一段：靠摺線的地方暗一點，看起來有弧度
+        shade(&on_flap.p, fold, fold + dir * (flap.width() * 0.5).min(70.0), y, shadow(30.0), Color32::TRANSPARENT);
+        // 自由邊落在底下那一頁的影子
+        shade(&book.p, tip, tip + dir * 28.0, y, shadow(52.0), Color32::TRANSPARENT);
+        if d.dark {
+            // 紙的邊緣再加一道反光，才看得出哪裡是翻起來的那一張
+            let glint = Color32::from_white_alpha((lift * 14.0).min(40.0) as u8);
+            book.p.vline(tip - dir * 0.5, y, Stroke::new(1.0, glint));
         }
     }
 
@@ -904,9 +1099,10 @@ impl NovelView {
         }
     }
 
-    fn paint_cover(&self, ui: &Ui, rect: Rect, pal: &Palette) {
+    fn paint_cover(&self, d: &Draw, rect: Rect) {
+        let (p, pal) = (&d.p, d.pal);
         if let Some(cover) = &self.book.cover {
-            if let Some(Ok((tex, [w, h]))) = images::get(&self.images, cover, ui.ctx()) {
+            if let Some(Ok((tex, [w, h]))) = images::get(&self.images, cover, p.ctx()) {
                 let size = vec2(w as f32, h as f32);
                 let scale = (rect.width() / size.x).max(rect.height() / size.y);
                 let shown = size * scale;
@@ -914,12 +1110,11 @@ impl NovelView {
                 let uv_w = (rect.width() / shown.x).min(1.0);
                 let uv_h = (rect.height() / shown.y).min(1.0);
                 let uv = Rect::from_center_size(pos2(0.5, 0.5), vec2(uv_w, uv_h));
-                ui.painter().image(tex, rect, uv, Color32::WHITE);
+                p.image(tex, rect, uv, Color32::WHITE);
                 return;
             }
         }
         // 沒有封面圖：用書名排一個簡單的封面
-        let p = ui.painter();
         let band = Rect::from_min_max(
             pos2(rect.left(), rect.top() + rect.height() * 0.3),
             pos2(rect.right(), rect.top() + rect.height() * 0.3 + 4.0),
@@ -961,7 +1156,11 @@ impl NovelView {
     fn ensure_layout(&mut self, ui: &Ui, content: egui::Vec2, prefs: &NovelPrefs) {
         // 章節檔案：讀取並快取段落
         let chapter = self.current_chapter().map(Path::to_path_buf);
-        let stamp = chapter.as_deref().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+        let stamp = match (&self.turn, &self.layout) {
+            // 翻頁動畫播放中不必每一幀都去問檔案系統（播完的那一幀會再確認）
+            (Some(_), Some(l)) if l.key.unit == self.unit => l.key.stamp,
+            _ => chapter.as_deref().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()),
+        };
         if let Some(path) = &chapter {
             let stale = self.blocks.as_ref().is_none_or(|(p, s, _)| p != path || *s != stamp);
             if stale {
@@ -1021,7 +1220,8 @@ impl NovelView {
         if self.unit == Unit::Front {
             layout.pages.insert(0, Page::Cover);
         }
-        self.layout = Some(Layout { key, lines: layout.lines, pages: layout.pages, line_len: layout.line_len });
+        self.layout =
+            Some(Rc::new(Layout { key, lines: layout.lines, pages: layout.pages, line_len: layout.line_len }));
         self.apply_want();
     }
 }
@@ -1462,9 +1662,8 @@ fn break_lines(toks: &[Tok], line_len: f32, first: f32, rest: f32, extent: f32) 
 // ---------------------------------------------------------------------------
 // 繪製
 
-fn paint_paper(ui: &Ui, rect: Rect, pal: &Palette) {
-    let p = ui.painter();
-    let dark = ui.visuals().dark_mode;
+fn paint_paper(d: &Draw, rect: Rect) {
+    let (p, dark) = (&d.p, d.dark);
     p.add(
         egui::Shadow {
             offset: [0, 4],
@@ -1474,24 +1673,36 @@ fn paint_paper(ui: &Ui, rect: Rect, pal: &Palette) {
         }
         .as_shape(rect, 2.0),
     );
-    p.rect_filled(rect, 2.0, pal.paper);
+    p.rect_filled(rect, 2.0, d.pal.paper);
 }
 
-fn paint_blank(ui: &Ui, rect: Rect, pal: &Palette) {
-    paint_paper(ui, rect, pal);
+/// 水平方向的漸層（影子）：`x0` 處是 `c0`，`x1` 處是 `c1`。
+fn shade(p: &egui::Painter, x0: f32, x1: f32, y: Rangef, c0: Color32, c1: Color32) {
+    if x0 == x1 || (c0.a() == 0 && c1.a() == 0) {
+        return;
+    }
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(pos2(x0, y.min), c0);
+    mesh.colored_vertex(pos2(x1, y.min), c1);
+    mesh.colored_vertex(pos2(x1, y.max), c1);
+    mesh.colored_vertex(pos2(x0, y.max), c0);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    p.add(Shape::mesh(mesh));
 }
 
-fn paint_image(ui: &Ui, inner: Rect, path: &Path, alt: &str, cache: &ImageCache, pal: &Palette) {
-    match images::get(cache, path, ui.ctx()) {
+fn paint_image(d: &Draw, inner: Rect, path: &Path, alt: &str, cache: &ImageCache) {
+    let (p, pal) = (&d.p, d.pal);
+    match images::get(cache, path, p.ctx()) {
         Some(Ok((tex, [w, h]))) => {
             let size = vec2(w as f32, h as f32);
             let scale = (inner.width() / size.x).min(inner.height() / size.y);
             let rect = Rect::from_center_size(inner.center(), size * scale);
-            ui.painter().image(tex, rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            p.image(tex, rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
         }
         Some(Err(e)) => {
             let label = if alt.is_empty() { "插圖" } else { alt };
-            ui.painter().text(
+            p.text(
                 inner.center(),
                 Align2::CENTER_CENTER,
                 format!("［{label}］\n{e}"),
@@ -1500,13 +1711,7 @@ fn paint_image(ui: &Ui, inner: Rect, path: &Path, alt: &str, cache: &ImageCache,
             );
         }
         None => {
-            ui.painter().text(
-                inner.center(),
-                Align2::CENTER_CENTER,
-                "載入插圖中…",
-                FontId::proportional(13.0),
-                pal.weak,
-            );
+            p.text(inner.center(), Align2::CENTER_CENTER, "載入插圖中…", FontId::proportional(13.0), pal.weak);
         }
     }
 }
@@ -1519,17 +1724,10 @@ fn color_of(style: u8, pal: &Palette) -> Color32 {
     }
 }
 
-fn paint_text(
-    ui: &Ui,
-    inner: Rect,
-    layout: &Layout,
-    page_lines: &[(usize, f32)],
-    prefs: &NovelPrefs,
-    pal: &Palette,
-    links: &mut Vec<(Rect, usize)>,
-) {
-    let p = ui.painter();
+fn paint_text(d: &Draw, inner: Rect, layout: &Layout, page_lines: &[(usize, f32)], links: &mut Vec<(Rect, usize)>) {
+    let (p, prefs, pal) = (&d.p, d.prefs, d.pal);
     let vertical = prefs.vertical;
+    let clip = p.clip_rect();
     // 行進方向置中對齊格子
     let slack = if vertical { inner.height() - layout.line_len } else { inner.width() - layout.line_len };
     let lead = (slack / 2.0).max(0.0);
@@ -1551,6 +1749,13 @@ fn paint_text(
                 Rect::from_min_max(pos2(along0, cross - thick / 2.0), pos2(along0 + line_w, cross + thick / 2.0))
             };
             links.push((r, target));
+        }
+        // 裁切範圍外的行不必畫：翻頁動畫中每一塊只露出一部分，直排時整行整行地省下來
+        let across = Rangef::new(cross - thick, cross + thick);
+        let along = Rangef::new(along0 - thick, along0 + line_w + thick);
+        let (xs, ys) = if vertical { (across, along) } else { (along, across) };
+        if !clip.x_range().intersects(xs) || !clip.y_range().intersects(ys) {
+            continue;
         }
         if vertical {
             paint_vertical_line(p, line, cross, along0, pal);
@@ -1902,6 +2107,258 @@ one two three four five six
         }
         assert_eq!(v.total_words(), Some(expected + 4));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 一本有兩章、每章好幾頁的書，不開視窗跑起來。
+    struct Stage {
+        ctx: egui::Context,
+        v: NovelView,
+        prefs: NovelPrefs,
+        dark: bool,
+        time: f64,
+        dir: PathBuf,
+        textures: crate::shot::Textures,
+        /// 上一幀畫了什麼、是否要求馬上再畫一幀
+        shapes: Vec<egui::epaint::ClippedShape>,
+        repaint: bool,
+    }
+
+    const STAGE: egui::Vec2 = vec2(1100.0, 700.0);
+
+    impl Stage {
+        fn new(name: &str) -> Stage {
+            let dir = std::env::temp_dir().join(format!("shosai-turn-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            for (file, title) in [("1.md", "第一章　出發"), ("2.md", "第二章　歸途")] {
+                let mut text = format!("# {title}\n\n");
+                for i in 0..40 {
+                    text.push_str(&"那一天的雨下得很久，他在窗邊等了一個下午。".repeat(2 + i % 4));
+                    text.push_str("「還要多久？」她問，手裡的茶已經涼了。\n\n");
+                }
+                std::fs::write(dir.join(file), text).unwrap();
+            }
+            let lib = shosai_core::Library::open(&dir).unwrap();
+            let v = NovelView::open(NovelBook::new(&dir, &lib.entries, None), None);
+            let ctx = egui::Context::default();
+            crate::theme::install(&ctx);
+            let mut stage = Stage {
+                ctx,
+                v,
+                prefs: NovelPrefs::default(),
+                dark: false,
+                time: 0.0,
+                dir,
+                textures: Default::default(),
+                shapes: Vec::new(),
+                repaint: false,
+            };
+            stage.v.go(Unit::Chapter(0), Want::First);
+            stage.settle();
+            stage
+        }
+
+        /// 跑一幀（過了 `dt` 秒），送入這些事件。
+        fn frame(&mut self, dt: f64, events: Vec<egui::Event>) {
+            self.time += dt;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), STAGE)),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            };
+            let pal = crate::theme::palette(self.dark);
+            let (v, prefs) = (&mut self.v, &self.prefs);
+            let mut out = self.ctx.run_ui(input, |ui| v.show(ui, &pal, prefs, &mut Vec::new()));
+            self.textures.update(&mut out.textures_delta);
+            self.repaint = out.viewport_output[&egui::ViewportId::ROOT].repaint_delay.is_zero();
+            self.shapes = out.shapes;
+        }
+
+        /// 不送輸入，一直跑到畫面不再要求重畫（背景的字數統計、動畫都結束）。
+        fn settle(&mut self) {
+            for _ in 0..600 {
+                self.frame(1.0 / 60.0, Vec::new());
+                if !self.repaint && self.v.words_rx.is_none() {
+                    return;
+                }
+                if self.v.words_rx.is_some() {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+            panic!("the view never came to rest");
+        }
+
+        /// 按下按鍵不放。同一個鍵沒放開又按一次，egui 就當成按住時系統送來的重複按鍵。
+        fn hold(&mut self, key: Key) {
+            self.key(key, true);
+        }
+
+        /// 按一下：這一幀按下，下一幀放開。
+        fn press(&mut self, key: Key) {
+            self.key(key, true);
+            self.key(key, false);
+        }
+
+        fn key(&mut self, key: Key, pressed: bool) {
+            let modifiers = egui::Modifiers::NONE;
+            let event = egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers };
+            self.frame(1.0 / 60.0, vec![event]);
+        }
+
+        fn at(&self) -> (Unit, usize) {
+            (self.v.unit, self.v.page)
+        }
+
+        fn save(&self, name: &str) {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/shots").join(name);
+            self.textures.save(&self.ctx, self.shapes.clone(), [STAGE.x as usize, STAGE.y as usize], &path);
+        }
+    }
+
+    impl Drop for Stage {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn turning_a_page_animates_then_rests() {
+        let mut s = Stage::new("basic");
+        assert_eq!(s.at(), (Unit::Chapter(0), 0));
+        assert!(s.v.turn.is_none() && !s.repaint, "at rest before any input");
+
+        // 直排：← 是下一頁。按下去的那一幀就換頁，動畫只是畫面上的過場
+        s.hold(Key::ArrowLeft);
+        assert_eq!(s.at(), (Unit::Chapter(0), 2), "a spread turns two pages");
+        assert!(s.v.turn.is_some() && s.repaint, "the animation started");
+        let (mut frames, mut most) = (1, s.shapes.len());
+        s.key(Key::ArrowLeft, false);
+        frames += 1;
+        while s.v.turn.is_some() {
+            s.frame(1.0 / 60.0, Vec::new());
+            assert!(s.repaint || s.v.turn.is_none(), "keeps repainting while it plays");
+            most = most.max(s.shapes.len());
+            frames += 1;
+            assert!(frames < 60, "the animation ends");
+        }
+        let secs = f64::from(frames) / 60.0;
+        assert!((TURN_SECS - 0.05..=TURN_SECS + 0.05).contains(&secs), "took {secs} s");
+        // egui 在最後一次要求重畫之後會再多畫一幀，然後就停了
+        s.frame(1.0 / 60.0, Vec::new());
+        assert!(!s.repaint, "and stops repainting");
+        // 動畫中要畫的東西不能比平常多太多（裁切範圍外的行都跳過了）
+        let still = s.shapes.len();
+        assert!(most < still * 3 / 2, "a still frame has {still} shapes, the animation peaked at {most}");
+
+        // 往回翻也一樣
+        s.frame(1.0, Vec::new());
+        s.press(Key::ArrowRight);
+        assert_eq!(s.at(), (Unit::Chapter(0), 0));
+        assert!(s.v.turn.as_ref().is_some_and(|t| !t.forward));
+        s.settle();
+        assert!(s.v.turn.is_none());
+    }
+
+    #[test]
+    fn rapid_turns_skip_the_animation() {
+        let mut s = Stage::new("rapid");
+        // 動畫還在播又翻：直接換頁
+        s.press(Key::ArrowLeft);
+        assert!(s.v.turn.is_some());
+        s.frame(0.1, Vec::new());
+        s.press(Key::ArrowLeft);
+        assert_eq!(s.at(), (Unit::Chapter(0), 4));
+        assert!(s.v.turn.is_none(), "the second turn snaps");
+        s.settle();
+
+        // 按住按鍵：第一下有動畫，之後系統送來的重複按鍵每一下都直接換頁，
+        // 就算隔得夠久也一樣
+        s.frame(1.0, Vec::new());
+        s.hold(Key::ArrowLeft);
+        assert!(s.v.turn.is_some());
+        s.frame(1.0, Vec::new());
+        s.hold(Key::ArrowLeft);
+        assert_eq!(s.at(), (Unit::Chapter(0), 8));
+        assert!(s.v.turn.is_none(), "a key repeat snaps");
+        s.key(Key::ArrowLeft, false);
+
+        // 停一下再翻，動畫又回來了
+        s.frame(1.0, Vec::new());
+        s.press(Key::ArrowRight);
+        assert!(s.v.turn.is_some());
+
+        // End 這類直接跳頁的動作會中止動畫
+        s.press(Key::End);
+        assert!(s.v.turn.is_none());
+        s.settle();
+
+        // 關掉設定就完全不播
+        s.frame(1.0, Vec::new());
+        s.prefs.turn_anim = false;
+        s.press(Key::ArrowRight);
+        assert!(s.v.turn.is_none());
+    }
+
+    #[test]
+    fn turning_across_chapters_animates_too() {
+        let mut s = Stage::new("chapters");
+        let last = s.v.layout.as_ref().unwrap().pages.len() - 1;
+        s.press(Key::End);
+        s.settle();
+        assert_eq!(s.at(), (Unit::Chapter(0), last & !1));
+        // 最後一面往後翻：進到下一章，舊的那一面還留著給動畫用
+        s.frame(1.0, Vec::new());
+        s.press(Key::ArrowLeft);
+        assert_eq!(s.at(), (Unit::Chapter(1), 0));
+        let turn = s.v.turn.as_ref().expect("animates into the next chapter");
+        assert_eq!((turn.from.unit, turn.from.page), (Unit::Chapter(0), last & !1));
+        s.settle();
+        // 往回翻：回到上一章的最後一面
+        s.frame(1.0, Vec::new());
+        s.press(Key::ArrowRight);
+        assert_eq!(s.at(), (Unit::Chapter(0), last & !1));
+        assert!(s.v.turn.is_some());
+        s.settle();
+        assert!(s.v.turn.is_none() && !s.repaint);
+    }
+
+    /// 把翻頁動畫的幾個瞬間存成圖片（`target/shots/`），用眼睛檢查：
+    /// `cargo test -p shosai turn_shots -- --ignored`
+    #[test]
+    #[ignore = "writes PNGs for looking at; run by hand"]
+    fn turn_shots() {
+        let cases = [
+            ("spread-vertical", true, true, false),
+            ("spread-horizontal", false, true, false),
+            ("single-vertical", true, false, false),
+            ("spread-vertical-dark", true, true, true),
+        ];
+        for (name, vertical, spread, dark) in cases {
+            let mut s = Stage::new(name);
+            // 測試環境沒有中文字型（程式執行時由系統字型補上）：找得到就裝一個，圖片裡才看得到字
+            if let Ok(bytes) = std::fs::read("C:/Windows/Fonts/msjh.ttc") {
+                let mut fonts = egui::FontDefinitions::default();
+                fonts.font_data.insert("cjk".into(), egui::FontData::from_owned(bytes).into());
+                fonts.families.entry(egui::FontFamily::Proportional).or_default().push("cjk".into());
+                s.ctx.set_fonts(fonts);
+            }
+            s.prefs.vertical = vertical;
+            s.prefs.spread = spread;
+            s.dark = dark;
+            s.settle();
+            s.save(&format!("{name}-0.png"));
+            let forward = if vertical { Key::ArrowLeft } else { Key::ArrowRight };
+            // 動畫全長 0.28 秒：在幾個時間點各存一張
+            s.hold(forward);
+            for (i, dt) in [0.02, 0.05, 0.07, 0.1].into_iter().enumerate() {
+                s.frame(dt, Vec::new());
+                assert!(s.v.turn.is_some(), "{name}: still turning at shot {i}");
+                s.save(&format!("{name}-{}.png", i + 1));
+            }
+            s.settle();
+            s.save(&format!("{name}-5.png"));
+        }
     }
 
     #[test]
