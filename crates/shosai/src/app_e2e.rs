@@ -562,6 +562,27 @@ impl Phone {
         self.settle();
     }
 
+    /// 畫面上寫著 `text` 的那段字的中心。依文字找、不寫死座標，
+    /// 版面因為路徑長短（Windows 與 Linux 的暫存資料夾不一樣長）多一行少一行也點得到。
+    fn find(&self, text: &str) -> Pos2 {
+        fn walk(shape: &egui::Shape, text: &str) -> Option<Pos2> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == text => {
+                    Some(t.galley.rect.translate(t.pos.to_vec2()).center())
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| walk(s, text)),
+                _ => None,
+            }
+        }
+        self.shapes.iter().find_map(|c| walk(&c.shape, text)).unwrap_or_else(|| panic!("「{text}」不在畫面上"))
+    }
+
+    /// 點畫面上寫著 `text` 的地方。
+    fn tap_text(&mut self, text: &str) {
+        let at = self.find(text);
+        self.tap(at);
+    }
+
     /// 手機的返回鍵。
     fn back(&mut self) {
         let key = |pressed| Event::Key {
@@ -651,18 +672,17 @@ fn phone_picks_its_library_folder() {
     let mut p = Phone::new("phone-picker");
     let library = p.dir.clone();
     assert!(!p.app.settings.library_picked, "the library it starts with was found, not picked");
-    let pick = pos2(PHONE.x * 0.5, 462.0);
     // 返回鍵關掉選擇畫面，書庫不變
-    p.tap(pick);
+    p.tap_text("選擇書庫資料夾…");
     assert!(p.app.folder_picker.is_some(), "the button on the bookshelf opens the folder picker");
     p.back();
     assert!(p.app.folder_picker.is_none(), "back closes it");
     assert_eq!(p.app.library.as_ref().map(|l| l.root.clone()), Some(library.clone()));
 
-    // 點進第一個資料夾，按「用這個資料夾」
-    p.tap(pick);
-    p.tap(pos2(PHONE.x * 0.5, 267.0));
-    p.tap(pos2(89.0, 181.0));
+    // 點進「星海航路」，按「用這個資料夾」
+    p.tap_text("選擇書庫資料夾…");
+    p.tap_text("星海航路");
+    p.tap_text("用這個資料夾");
     assert!(p.app.folder_picker.is_none(), "choosing closes the picker");
     let chosen = library.join("星海航路");
     assert_eq!(p.app.library.as_ref().map(|l| l.root.clone()), Some(chosen.clone()), "the folder is now the library");
@@ -696,7 +716,7 @@ fn phone_asks_for_file_access() {
     p.app.files_access = None;
     p.settle();
     p.save("mobile-9-access.png");
-    p.tap(pos2(180.0, 423.0));
+    p.tap_text("前往設定允許");
     assert_eq!(p.device.requests.get(), 1, "the button opens the settings page");
 
     // 沒權限時打開一本書：說明是權限的問題，而不是「沒有 Markdown 檔」
