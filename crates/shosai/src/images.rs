@@ -58,7 +58,8 @@ pub fn get(
 }
 
 fn load(path: &Path, ctx: &egui::Context) -> ImageState {
-    if !path.is_file() {
+    // 只有真的不存在才說「找不到」；沒有權限之類的錯誤交給下面照實回報
+    if std::fs::metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
         return ImageState::Failed(missing_message(path));
     }
     let img = match image::open(path) {

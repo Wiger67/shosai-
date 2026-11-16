@@ -634,6 +634,14 @@ impl ShosaiApp {
     // -----------------------------------------------------------------------
     // 檔案操作
 
+    /// 換成另一個書庫：先存好正在編輯的文件、關掉開著的文件與 PDF。
+    fn switch_library(&mut self, root: &Path) {
+        self.save_current();
+        self.doc = None;
+        self.pdf = None;
+        self.open_library(root);
+    }
+
     fn open_library(&mut self, root: &Path) {
         match Library::open(root) {
             Ok(lib) => {
@@ -1207,22 +1215,14 @@ impl ShosaiApp {
                     }
                 }
                 Action::OpenNovel { root, chapter } => self.open_novel(&root, chapter.as_deref()),
-                Action::OpenLibrary(p) => {
-                    self.save_current();
-                    self.doc = None;
-                    self.pdf = None;
-                    self.open_library(&p);
-                }
+                Action::OpenLibrary(p) => self.switch_library(&p),
                 Action::PickLibrary if self.mobile => {
                     let start = FolderPicker::start(self.library.as_ref().map(|l| l.root.as_path()));
                     self.folder_picker = Some(FolderPicker::open(&start));
                 }
                 Action::PickLibrary => {
                     if let Some(dir) = pick_folder() {
-                        self.save_current();
-                        self.doc = None;
-                        self.pdf = None;
-                        self.open_library(&dir);
+                        self.switch_library(&dir);
                     }
                 }
                 Action::Dialog(d) => self.dialog = Some(d),
@@ -3238,10 +3238,7 @@ impl eframe::App for ShosaiApp {
                 Some(Picked::Chosen(dir)) => {
                     self.folder_picker = None;
                     self.close_novel(false);
-                    self.save_current();
-                    self.doc = None;
-                    self.pdf = None;
-                    self.open_library(&dir);
+                    self.switch_library(&dir);
                     // 開不起來（例如沒有權限）就不算選過，下次啟動照樣自動找
                     if self.library.as_ref().is_some_and(|l| l.root == dir) {
                         self.settings.library_picked = true;

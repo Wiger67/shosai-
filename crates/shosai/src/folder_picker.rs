@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Color32, RichText};
+use shosai_core::library;
 
 use crate::theme::Palette;
 
@@ -21,6 +22,8 @@ pub struct FolderPicker {
     /// 這個資料夾裡直接放了幾個 Markdown 檔
     notes: usize,
     error: Option<String>,
+    /// 上方可以直接跳過去的地方（名稱、路徑）：存在、而且不是現在這個資料夾的才列出來
+    shortcuts: Vec<(&'static str, &'static Path)>,
 }
 
 pub enum Picked {
@@ -30,7 +33,8 @@ pub enum Picked {
 
 impl FolderPicker {
     pub fn open(start: &Path) -> FolderPicker {
-        let mut picker = FolderPicker { dir: PathBuf::new(), dirs: Vec::new(), notes: 0, error: None };
+        let mut picker =
+            FolderPicker { dir: PathBuf::new(), dirs: Vec::new(), notes: 0, error: None, shortcuts: Vec::new() };
         picker.go(start.to_path_buf());
         picker
     }
@@ -53,8 +57,8 @@ impl FolderPicker {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     let name = entry.file_name().to_string_lossy().into_owned();
-                    // 隱藏資料夾（.shosai、.thumbnails…）不會是書庫
-                    if name.starts_with('.') {
+                    // 隱藏資料夾（.shosai、.thumbnails…）與書櫃也不列的資料夾不會是書庫
+                    if name.starts_with('.') || library::IGNORED_DIRS.contains(&name.as_str()) {
                         continue;
                     }
                     if path.is_dir() {
@@ -63,10 +67,17 @@ impl FolderPicker {
                         self.notes += 1;
                     }
                 }
-                self.dirs.sort_by_cached_key(|(_, name)| name.to_lowercase());
+                // 和書櫃一樣的順序（「第2卷」在「第10卷」前面）
+                self.dirs.sort_by(|(_, a), (_, b)| library::natural_cmp(a, b));
             }
             Err(e) => self.error = Some(format!("讀不到這個資料夾：{e}")),
         }
+        // 換資料夾時才看一次捷徑在不在（手機上每次都要問儲存空間，別每一幀都問）
+        self.shortcuts = [("內部儲存空間", INTERNAL_STORAGE), ("Nextcloud", NEXTCLOUD_FILES)]
+            .into_iter()
+            .map(|(label, path)| (label, Path::new(path)))
+            .filter(|(_, path)| *path != dir && path.is_dir())
+            .collect();
         self.dir = dir;
     }
 
@@ -89,9 +100,8 @@ impl FolderPicker {
                         go = Some(parent.to_path_buf());
                     }
                 }
-                for (label, path) in [("內部儲存空間", INTERNAL_STORAGE), ("Nextcloud", NEXTCLOUD_FILES)] {
-                    let path = Path::new(path);
-                    if path != self.dir && path.is_dir() && chip(ui, label).clicked() {
+                for (label, path) in &self.shortcuts {
+                    if chip(ui, label).clicked() {
                         go = Some(path.to_path_buf());
                     }
                 }

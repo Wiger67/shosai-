@@ -183,6 +183,20 @@ struct Layout {
     strip: Option<Strip>,
 }
 
+impl Layout {
+    /// 連續捲動的長條裡依序的每一行：（行的上緣在長條上的位置，那一行）。不是長條的話沒有東西。
+    fn strip_lines(&self) -> impl Iterator<Item = (f32, &Line)> + '_ {
+        let blocks = self.strip.iter().flat_map(|s| &s.blocks);
+        self.pages.iter().zip(blocks).flat_map(move |(page, (top, _))| {
+            let lines: &[(usize, f32)] = match page {
+                Page::Text(ls) => ls,
+                _ => &[],
+            };
+            lines.iter().map(move |(li, pos)| (top + pos, &self.lines[*li]))
+        })
+    }
+}
+
 /// 連續捲動時整章排成的一長條。
 struct Strip {
     /// 每一頁的上緣與高度（點，從長條最上面算起）
@@ -327,8 +341,8 @@ pub struct NovelView {
     scrolling: bool,
     /// 放大中的插圖
     zoom: Option<Zoom>,
-    /// 上一幀畫在哪裡的插圖：兩指撐開時要知道手指下面是不是插圖
-    image_rects: Vec<(Rect, PathBuf)>,
+    /// 上一幀畫在哪裡的插圖（範圍、第幾頁）：兩指撐開時要知道手指下面是不是插圖
+    image_rects: Vec<(Rect, usize)>,
 }
 
 impl NovelView {
@@ -414,15 +428,12 @@ impl NovelView {
             Some(l) => match &l.strip {
                 // 連續捲動：畫面最上面那一行（看得到一半以上的第一行；
                 // 回到這個位置時上面多留了一點空間，用行的下緣判斷會多算進上一行）
-                Some(strip) => {
+                Some(_) => {
                     let mut last = 0;
-                    for (page, (top, _)) in l.pages.iter().zip(&strip.blocks) {
-                        let Page::Text(ls) = page else { continue };
-                        for (li, pos) in ls {
-                            last = l.lines[*li].src;
-                            if top + pos + l.lines[*li].extent * 0.5 > self.scroll {
-                                return last;
-                            }
+                    for (y, line) in l.strip_lines() {
+                        last = line.src;
+                        if y + line.extent * 0.5 > self.scroll {
+                            break;
                         }
                     }
                     last
@@ -505,19 +516,12 @@ impl NovelView {
         }
     }
 
-    fn next_page(&mut self, spread: bool) {
+    /// 往後（`forward`）或往前翻一頁；連續捲動時是捲一個畫面。
+    fn flip(&mut self, spread: bool, forward: bool) {
         if self.scroll_mode() {
-            self.scroll_screen(true);
+            self.scroll_screen(forward);
         } else {
-            self.turn_page(spread, true);
-        }
-    }
-
-    fn prev_page(&mut self, spread: bool) {
-        if self.scroll_mode() {
-            self.scroll_screen(false);
-        } else {
-            self.turn_page(spread, false);
+            self.turn_page(spread, forward);
         }
     }
 
@@ -552,17 +556,19 @@ impl NovelView {
 
     /// 連續捲動捲過這一章的頭尾：往後是下一章的開頭，往前是上一章的最後。
     fn chapter_after_scroll(&mut self, forward: bool) {
-        let Unit::Chapter(i) = self.unit else { return };
         if forward {
-            if i + 1 < self.book.chapters.len() {
-                self.go(Unit::Chapter(i + 1), Want::First);
-            } else {
-                self.end_flash = Some(std::time::Instant::now());
-            }
-        } else if i == 0 {
-            self.go(Unit::Front, Want::Last);
+            self.next_chapter();
         } else {
-            self.go(Unit::Chapter(i - 1), Want::Last);
+            self.prev_chapter_end();
+        }
+    }
+
+    /// 回到上一章的最後一頁（第一章之前是封面與目錄）。
+    fn prev_chapter_end(&mut self) {
+        match self.unit {
+            Unit::Chapter(0) => self.go(Unit::Front, Want::Last),
+            Unit::Chapter(i) => self.go(Unit::Chapter(i - 1), Want::Last),
+            Unit::Front => {}
         }
     }
 
@@ -604,50 +610,30 @@ impl NovelView {
         let n = self.layout.as_ref().map(|l| l.pages.len()).unwrap_or(0);
         if self.page + self.step(spread) < n {
             self.page += self.step(spread);
-            return;
-        }
-        let next = match self.unit {
-            Unit::Front => Some(0),
-            Unit::Chapter(i) => Some(i + 1),
-        };
-        match next.filter(|i| *i < self.book.chapters.len()) {
-            Some(i) => self.go(Unit::Chapter(i), Want::First),
-            None => self.end_flash = Some(std::time::Instant::now()),
+        } else {
+            self.next_chapter();
         }
     }
 
     fn step_back(&mut self, spread: bool) {
         if self.page >= self.step(spread) {
             self.page -= self.step(spread);
-            return;
-        }
-        match self.unit {
-            Unit::Chapter(0) => self.go(Unit::Front, Want::Last),
-            Unit::Chapter(i) => self.go(Unit::Chapter(i - 1), Want::Last),
-            Unit::Front => {}
+        } else {
+            self.prev_chapter_end();
         }
     }
 
     fn apply_want(&mut self) {
+        let max = self.max_scroll();
         let Some(l) = &self.layout else { return };
-        if let Some(strip) = &l.strip {
-            let max = (strip.height - self.view_h).max(0.0);
+        if l.strip.is_some() {
             let y = match self.want {
                 Want::First => 0.0,
                 Want::Last => max,
                 Want::Offset(o) => {
-                    let mut best = 0.0;
-                    'pages: for (page, (top, _)) in l.pages.iter().zip(&strip.blocks) {
-                        let Page::Text(ls) = page else { continue };
-                        for (li, pos) in ls {
-                            if l.lines[*li].src > o {
-                                break 'pages;
-                            }
-                            best = top + pos;
-                        }
-                    }
+                    let line = l.strip_lines().take_while(|(_, line)| line.src <= o).last();
                     // 那一行的上面留一點空間
-                    best - 8.0
+                    line.map_or(0.0, |(y, _)| y) - 8.0
                 }
             };
             self.page = 0;
@@ -817,10 +803,7 @@ impl NovelView {
     /// 狀態列的頁數：連續捲動時沒有頁，改成這一章讀了多少。
     fn page_label(&self, pages: usize) -> String {
         match self.layout.as_ref().and_then(|l| l.strip.as_ref()) {
-            Some(s) => {
-                let max = (s.height - self.view_h).max(1.0);
-                format!("本章 {:.0}%", (self.scroll / max * 100.0).clamp(0.0, 100.0))
-            }
+            Some(_) => format!("本章 {:.0}%", (self.scroll / self.max_scroll().max(1.0) * 100.0).clamp(0.0, 100.0)),
             None => format!("{} / {} 頁", self.page + 1, pages),
         }
     }
@@ -944,7 +927,9 @@ impl NovelView {
         }
         // 兩指在插圖上撐開：放大檢視
         if let Some(m) = multi.filter(|m| self.zoom.is_none() && m.zoom_delta > 1.0) {
-            if let Some((_, path)) = self.image_rects.iter().find(|(r, _)| r.contains(m.center_pos)) {
+            let hit = self.image_rects.iter().find(|(r, _)| r.contains(m.center_pos)).map(|(_, page)| *page);
+            let page = hit.and_then(|i| self.layout.as_ref()?.pages.get(i));
+            if let Some(Page::Image { path, .. }) = page {
                 self.zoom = Some(Zoom { path: path.clone(), scale: 1.0, pan: Vec2::ZERO, last_tap: None });
             }
         }
@@ -1026,8 +1011,8 @@ impl NovelView {
                 }
                 // 記下插圖畫在哪裡（兩指撐開時要知道）
                 for (rect, idx) in [(Some(far), here.page), (near, here.page + 1)] {
-                    if let (Some(rect), Some(Page::Image { path, .. })) = (rect, here.layout.pages.get(idx)) {
-                        self.image_rects.push((Rect::from_min_size(rect.min + margin, content), path.clone()));
+                    if let (Some(rect), Some(Page::Image { .. })) = (rect, here.layout.pages.get(idx)) {
+                        self.image_rects.push((Rect::from_min_size(rect.min + margin, content), idx));
                     }
                 }
             }
@@ -1044,63 +1029,70 @@ impl NovelView {
         }
 
         // 目錄頁的連結
-        let link_at = |p: Option<egui::Pos2>| p.and_then(|p| links.iter().find(|(r, _)| r.contains(p)));
-        let hover_link = link_at(ui.input(|i| i.pointer.hover_pos()));
-        if let Some((r, _)) = hover_link {
+        let link_at = |p: egui::Pos2| links.iter().find(|(r, _)| r.contains(p));
+        if let Some((r, _)) = ui.input(|i| i.pointer.hover_pos()).and_then(link_at) {
             ui.painter().rect_filled(r.expand(2.0), 4.0, pal.hover);
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
-        // 手機：左右滑動翻頁。像撥紙一樣，往哪邊滑，紙就往哪邊走
-        // （橫排的下一頁在右邊，要往左撥；直排相反）
+        let gesture = self.gesture(ui, &resp);
+        let clicked_link = match gesture {
+            Some(Gesture::Tap(p)) => link_at(p).map(|(_, i)| *i),
+            _ => None,
+        };
+
+        let bar_y = area.bottom() - 7.0;
+        self.paint_progress(
+            ui.painter(),
+            Rect::from_x_y_ranges(top_left.x..=top_left.x + total_w, bar_y - 1.5..=bar_y + 1.5),
+            pal,
+        );
+        self.paint_end_flash(ui, area, pal);
+
+        match (clicked_link, gesture) {
+            (Some(ch), _) => self.go(Unit::Chapter(ch), Want::First),
+            (None, Some(Gesture::Tap(p))) => self.tap(p, area, prefs, spread),
+            // 手機：左右滑動翻頁。像撥紙一樣，往哪邊滑，紙就往哪邊走
+            // （橫排的下一頁在右邊，要往左撥；直排相反）
+            (None, Some(Gesture::Drag(d))) if swipe_turns(d) => self.flip(spread, (d.x < 0.0) != prefs.vertical),
+            _ => {}
+        }
+        if self.turn.is_some() {
+            // 只有動畫播放中才連續重畫；播完就停
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// 這一幀放開手指的結果（兩指縮放過的話什麼都不算）。
+    ///
+    /// 點在哪裡要另外記：手指放開的那一幀已經沒有「游標位置」了。手指點下去時微微移動，
+    /// 系統就當成「拖曳」而不是「點一下」：沒滑多遠就照點一下處理，否則常常要點兩三次才有反應。
+    fn gesture(&mut self, ui: &Ui, resp: &egui::Response) -> Option<Gesture> {
         if resp.drag_started() {
             self.swipe_from = ui.input(|i| i.pointer.press_origin());
         }
         if let Some(d) = resp.total_drag_delta() {
             self.swipe = d;
         }
-        let mut swiped = None;
-        // 點在哪裡要另外問：手指放開的那一幀已經沒有「游標位置」了
-        let mut tapped = if resp.clicked() { resp.interact_pointer_pos() } else { None };
-        if resp.drag_stopped() {
-            let d = std::mem::take(&mut self.swipe);
-            let from = self.swipe_from.take();
-            if swipe_turns(d) {
-                swiped = Some((d.x < 0.0) != prefs.vertical);
-            } else if d.length() < TAP_SLOP {
-                // 手指點下去時微微移動，系統就當成「拖曳」而不是「點一下」：
-                // 沒滑多遠就照點一下處理，否則常常要點兩三次才翻得過去
-                tapped = from;
-            }
-        }
-        if self.pinched && (resp.clicked() || resp.drag_stopped()) {
-            // 剛才是兩指縮放，放開時不翻頁
-            (tapped, swiped) = (None, None);
-        }
-        let clicked_link = link_at(tapped).map(|(_, i)| *i);
-
-        // 進度條
-        let bar_y = area.bottom() - 7.0;
-        let bar = Rect::from_min_max(pos2(top_left.x, bar_y - 1.5), pos2(top_left.x + total_w, bar_y + 1.5));
-        ui.painter().rect_filled(bar, 1.5, pal.guide);
-        let done = Rect::from_min_max(bar.min, pos2(bar.left() + bar.width() * self.progress(), bar.bottom()));
-        ui.painter().rect_filled(done, 1.5, pal.accent);
-        self.paint_end_flash(ui, area, pal);
-
-        if let Some(ch) = clicked_link {
-            self.go(Unit::Chapter(ch), Want::First);
-        } else if let Some(p) = tapped {
-            self.tap(p, area, prefs, spread);
-        } else if let Some(forward) = swiped {
-            if forward {
-                self.next_page(spread)
+        let gesture = if resp.clicked() {
+            resp.interact_pointer_pos().map(Gesture::Tap)
+        } else if resp.drag_stopped() {
+            let (d, from) = (std::mem::take(&mut self.swipe), self.swipe_from.take());
+            if d.length() < TAP_SLOP {
+                from.map(Gesture::Tap)
             } else {
-                self.prev_page(spread)
+                Some(Gesture::Drag(d))
             }
-        }
-        if self.turn.is_some() {
-            // 只有動畫播放中才連續重畫；播完就停
-            ui.ctx().request_repaint();
-        }
+        } else {
+            None
+        };
+        gesture.filter(|_| !self.pinched)
+    }
+
+    /// 進度條：`bar` 是整條的範圍，讀過的部分塗上強調色。
+    fn paint_progress(&self, p: &egui::Painter, bar: Rect, pal: &Palette) {
+        p.rect_filled(bar, 1.5, pal.guide);
+        let done = Rect::from_min_max(bar.min, pos2(bar.left() + bar.width() * self.progress(), bar.bottom()));
+        p.rect_filled(done, 1.5, pal.accent);
     }
 
     /// 讀完最後一頁時短暫顯示的提示。
@@ -1148,9 +1140,6 @@ impl NovelView {
         let max = self.max_scroll();
 
         // 手指拖著捲。拉過頭尾的部分另外記著（放手時決定要不要換章）
-        if resp.drag_started() {
-            self.swipe_from = ui.input(|i| i.pointer.press_origin());
-        }
         if resp.is_pointer_button_down_on() {
             self.fling = 0.0;
         }
@@ -1160,30 +1149,15 @@ impl NovelView {
             self.over = pos - self.scroll;
             self.drag_vel = ui.input(|i| i.pointer.velocity().y);
         }
-        if let Some(d) = resp.total_drag_delta() {
-            self.swipe = d;
-        }
-        let mut tapped = if resp.clicked() { resp.interact_pointer_pos() } else { None };
-        let mut change = None;
-        if resp.drag_stopped() {
-            let d = std::mem::take(&mut self.swipe);
-            let from = self.swipe_from.take();
-            let over = std::mem::take(&mut self.over);
-            if self.pinched {
-                // 兩指縮放，不是捲動
-            } else if over.abs() >= PULL_TO_TURN {
-                change = Some(over > 0.0);
-            } else if swipe_turns(d) {
-                // 左右撥也可以：和翻頁時一樣，往左撥是往後
-                self.scroll_screen(d.x < 0.0);
-            } else if d.length() < TAP_SLOP {
-                tapped = from;
-            } else {
-                self.fling = -std::mem::take(&mut self.drag_vel);
-            }
-        }
-        if self.pinched && (resp.clicked() || resp.drag_stopped()) {
-            tapped = None;
+        let over = if resp.drag_stopped() { std::mem::take(&mut self.over) } else { 0.0 };
+        let (mut tapped, mut change) = (None, None);
+        match self.gesture(ui, resp) {
+            Some(Gesture::Tap(p)) => tapped = Some(p),
+            Some(Gesture::Drag(_)) if over.abs() >= PULL_TO_TURN => change = Some(over > 0.0),
+            // 左右撥也可以：和翻頁時一樣，往左撥是往後
+            Some(Gesture::Drag(d)) if swipe_turns(d) => self.scroll_screen(d.x < 0.0),
+            Some(Gesture::Drag(_)) => self.fling = -std::mem::take(&mut self.drag_vel),
+            None => {}
         }
         // 慣性：每秒減掉大部分速度，碰到頭尾就停
         if self.fling != 0.0 && !resp.dragged() {
@@ -1206,7 +1180,7 @@ impl NovelView {
         // 拉過頭尾時內容跟著手指走一小段，看得出「拉到底了」
         let top = area.top() - self.scroll - self.over * 0.4;
         let mut links = Vec::new();
-        for (page, (y, h)) in layout.pages.iter().zip(&strip.blocks) {
+        for (idx, (page, (y, h))) in layout.pages.iter().zip(&strip.blocks).enumerate() {
             let rect = Rect::from_min_size(pos2(area.left() + margin_x, top + y), vec2(content.x, *h));
             if rect.bottom() < area.top() || rect.top() > area.bottom() {
                 continue;
@@ -1215,17 +1189,15 @@ impl NovelView {
                 Page::Text(lines) => paint_text(&draw, rect, &layout, lines, &mut links),
                 Page::Image { path, alt } => {
                     paint_image(&draw, rect, path, alt, &self.images);
-                    self.image_rects.push((rect, path.clone()));
+                    self.image_rects.push((rect, idx));
                 }
                 Page::Cover => self.paint_cover(&draw, rect),
             }
         }
 
-        // 最後：本章完，以及怎麼到下一章
-        let next = match self.unit {
-            Unit::Chapter(i) => self.book.chapters.get(i + 1).map(|c| c.title.as_str()),
-            Unit::Front => None,
-        };
+        // 最後：本章完，以及怎麼到下一章（連續捲動的一定是章節）
+        let Unit::Chapter(i) = self.unit else { return };
+        let next = self.book.chapters.get(i + 1).map(|c| c.title.as_str());
         let foot = top + strip.height - STRIP_FOOTER;
         let small = FontId::proportional(13.0);
         p.text(pos2(area.center().x, foot + 30.0), Align2::CENTER_CENTER, "－ 本章完 －", small.clone(), pal.weak);
@@ -1235,19 +1207,15 @@ impl NovelView {
             None => "全書完".to_string(),
         };
         p.text(pos2(area.center().x, foot + 60.0), Align2::CENTER_CENTER, hint, small.clone(), pal.weak);
-        if self.over < 0.0 && !matches!(self.unit, Unit::Front) {
+        if self.over < 0.0 {
             let hint =
                 if self.over <= -PULL_TO_TURN { "放開，回到上一章" } else { "繼續往下拉：上一章" };
             p.text(pos2(area.center().x, area.top() + 16.0), Align2::CENTER_CENTER, hint, small, pal.weak);
         }
 
-        // 進度條
         let bar_y = area.bottom() - 4.0;
-        let bar =
-            Rect::from_min_max(pos2(area.left() + margin_x, bar_y - 1.5), pos2(area.right() - margin_x, bar_y + 1.5));
-        p.rect_filled(bar, 1.5, pal.guide);
-        let done = Rect::from_min_max(bar.min, pos2(bar.left() + bar.width() * self.progress(), bar.bottom()));
-        p.rect_filled(done, 1.5, pal.accent);
+        let bar = Rect::from_x_y_ranges(area.left() + margin_x..=area.right() - margin_x, bar_y - 1.5..=bar_y + 1.5);
+        self.paint_progress(&p, bar, pal);
         self.paint_end_flash(ui, area, pal);
 
         if let Some(forward) = change {
@@ -1263,6 +1231,11 @@ impl NovelView {
     /// 放大檢視插圖：兩指縮放、一指拖曳；點兩下（或按返回鍵）回到書頁。
     fn show_zoom(&mut self, ui: &Ui, area: Rect, resp: &egui::Response, multi: Option<egui::MultiTouchInfo>) {
         let close = ui.input(|i| i.key_pressed(Key::BrowserBack) || i.key_pressed(Key::Escape));
+        // 點一下：和翻頁時一樣，手指微微移動也算（egui 自己的「點兩下」只容許 6 點）
+        let tap = match self.gesture(ui, resp) {
+            Some(Gesture::Tap(p)) => Some(p),
+            _ => None,
+        };
         let Some(z) = &mut self.zoom else { return };
         let loaded = images::get(&self.images, &z.path, ui.ctx());
         let Some(Ok((tex, [w, h]))) = loaded else {
@@ -1270,22 +1243,8 @@ impl NovelView {
             ui.ctx().request_repaint();
             return;
         };
-        // 點一下：和翻頁時一樣，手指微微移動也算（egui 自己的「點兩下」只容許 6 點）
-        if resp.drag_started() {
-            self.swipe_from = ui.input(|i| i.pointer.press_origin());
-        }
-        if let Some(d) = resp.total_drag_delta() {
-            self.swipe = d;
-        }
-        let mut tap = if resp.clicked() { resp.interact_pointer_pos() } else { None };
-        if resp.drag_stopped() {
-            let from = self.swipe_from.take();
-            if std::mem::take(&mut self.swipe).length() < TAP_SLOP {
-                tap = from;
-            }
-        }
         let mut double = false;
-        if let Some(at) = tap.filter(|_| !self.pinched) {
+        if let Some(at) = tap {
             let now = ui.input(|i| i.time);
             double = z.last_tap.is_some_and(|(t, p)| now - t < 0.4 && p.distance(at) < 40.0);
             z.last_tap = if double { None } else { Some((now, at)) };
@@ -1333,27 +1292,16 @@ impl NovelView {
             FontId::proportional(12.0),
             Color32::from_gray(150),
         );
-        self.image_rects.push((area, z.path.clone()));
     }
 
     /// 點在頁面 `p`：左右兩側翻頁，中間開關目錄。
     fn tap(&mut self, p: egui::Pos2, area: Rect, prefs: &NovelPrefs, spread: bool) {
         let t = (p.x - area.left()) / area.width();
-        let forward_on_right = !prefs.vertical;
-        if t < 0.35 {
-            if forward_on_right {
-                self.prev_page(spread)
-            } else {
-                self.next_page(spread)
-            }
-        } else if t > 0.65 {
-            if forward_on_right {
-                self.next_page(spread)
-            } else {
-                self.prev_page(spread)
-            }
-        } else {
+        if (0.35..=0.65).contains(&t) {
             self.show_toc = !self.show_toc;
+        } else {
+            // 橫排的下一頁在右邊，直排在左邊
+            self.flip(spread, (t > 0.65) != prefs.vertical);
         }
     }
 
@@ -1521,10 +1469,10 @@ impl NovelView {
             // 直排的書由右往左翻：← 是下一頁
             let (fwd_h, back_h) = if prefs.vertical { (back_h, fwd_h) } else { (fwd_h, back_h) };
             if fwd || fwd_h {
-                self.next_page(spread);
+                self.flip(spread, true);
             }
             if back || back_h {
-                self.prev_page(spread);
+                self.flip(spread, false);
             }
             if home {
                 self.page = 0;
@@ -1582,11 +1530,7 @@ impl NovelView {
                 let pages = wheel_pages(&mut self.wheel, lines, points);
                 for _ in 0..pages.abs() {
                     // 正值是內容往下移＝往回翻
-                    if pages < 0 {
-                        self.next_page(spread);
-                    } else {
-                        self.prev_page(spread);
-                    }
+                    self.flip(spread, pages < 0);
                 }
             }
         }
@@ -2329,6 +2273,12 @@ fn paint_text(d: &Draw, inner: Rect, layout: &Layout, page_lines: &[(usize, f32)
         } else {
             (inner.top() + bpos + thick / 2.0, inner.left() + lead + shift)
         };
+        // 行是依序排的：這一行已經整個在裁切範圍的另一頭（橫排的下方、直排的左方），後面的也都看不到。
+        // 連續捲動時整章是一段，不這樣的話每一幀都要把整章的每一行算過一遍
+        let past = if vertical { cross + thick < clip.left() } else { cross - thick > clip.bottom() };
+        if past {
+            break;
+        }
         if let Some(target) = line.link {
             let r = if vertical {
                 Rect::from_min_max(pos2(cross - thick / 2.0, along0), pos2(cross + thick / 2.0, along0 + line_w))
@@ -2521,6 +2471,15 @@ const SWIPE_MIN: f32 = 36.0;
 /// 介於這個和 [`SWIPE_MIN`] 之間的拖曳什麼都不做：看不出是想點還是想滑。
 const TAP_SLOP: f32 = 16.0;
 
+/// 放開手指時，剛才那一下是什麼。
+#[derive(Clone, Copy)]
+enum Gesture {
+    /// 點一下（在這裡）
+    Tap(egui::Pos2),
+    /// 拖了一段（總位移）
+    Drag(Vec2),
+}
+
 /// 把這一幀的滾輪量加進累積量 `acc`（單位：頁），回傳現在要翻幾頁（負值往後翻，正值往回翻）。
 ///
 /// `lines` 是滑鼠滾輪的格數：一格一頁，同一幀滾了幾格就翻幾頁。
@@ -2707,6 +2666,16 @@ one two three four five six
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// 滑鼠左鍵（或第一根手指）在 `pos` 按下或放開。
+    fn button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
     /// 一本有兩章、每章好幾頁的書，不開視窗跑起來。
     struct Stage {
         ctx: egui::Context,
@@ -2794,12 +2763,6 @@ one two three four five six
 
         /// 按著從 `from` 拖到 `to` 再放開（手指滑動也是這樣進來的）。
         fn drag(&mut self, from: egui::Pos2, to: egui::Pos2) {
-            let button = |pos, pressed| egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed,
-                modifiers: egui::Modifiers::NONE,
-            };
             let dt = 1.0 / 60.0;
             self.frame(dt, vec![egui::Event::PointerMoved(from), button(from, true)]);
             for i in 1..=4 {
@@ -2849,14 +2812,8 @@ one two three four five six
 
         /// 手指點一下（沒有移動）。
         fn click(&mut self, at: egui::Pos2) {
-            let button = |pressed| egui::Event::PointerButton {
-                pos: at,
-                button: egui::PointerButton::Primary,
-                pressed,
-                modifiers: egui::Modifiers::NONE,
-            };
-            self.frame(1.0 / 60.0, vec![egui::Event::PointerMoved(at), button(true)]);
-            self.frame(1.0 / 60.0, vec![button(false)]);
+            self.frame(1.0 / 60.0, vec![egui::Event::PointerMoved(at), button(at, true)]);
+            self.frame(1.0 / 60.0, vec![button(at, false)]);
         }
 
         /// 兩指以 `center` 為中心撐開（`spread` > 1）或捏合，和 egui-winit 一樣：
@@ -2868,12 +2825,6 @@ one two three four five six
                 phase,
                 pos,
                 force: None,
-            };
-            let button = |pos, pressed| egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed,
-                modifiers: egui::Modifiers::NONE,
             };
             let fingers = |k: f32| (center - vec2(40.0 * k, 0.0), center + vec2(40.0 * k, 0.0));
             let dt = 1.0 / 60.0;
