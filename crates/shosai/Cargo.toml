@@ -10,11 +10,19 @@ eframe = { version = "0.37", default-features = false, features = ["glow", "x11"
 egui_extras = { version = "0.37", default-features = false, features = ["image", "file", "svg"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 serde = { version = "1", features = ["derive"] }
-rfd = "0.15"
 # PDF 檢視（已是 Typst 的相依套件，不會額外增加體積）
 hayro = { version = "0.7", optional = true }
 # 監看書庫資料夾：有檔案新增、刪除時自動更新檔案樹
 notify = "8.2"
+
+# 系統的檔案對話框（Android 沒有對應的實作）
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rfd = "0.15"
+
+# Android 版：用 NativeActivity（不需要 Java 程式碼）
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["android-native-activity"] }
+winit = { version = "0.30", default-features = false, features = ["android-native-activity"] }
 
 [build-dependencies]
 # 嵌入 Windows exe 圖示（只在編譯 Windows 版時使用）

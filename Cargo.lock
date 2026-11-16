@@ -4576,7 +4576,15 @@ dependencies = [
  "rfd",
  "serde",
  "shosai-core",
+ "winit",
  "winresource",
+]
+
+[[package]]
+name = "shosai-android"
+version = "0.1.0"
+dependencies = [
+ "shosai",
 ]
 
 [[package]]

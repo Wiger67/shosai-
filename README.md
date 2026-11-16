@@ -18,6 +18,7 @@
 - **Nextcloud 同步**（實驗性）：透過 WebDAV 雙向同步，衝突時兩份都保留
 - **LaTeX 數學式與 HackMD 語法**：`$...$`、`$$...$$`、`:::info` 提示框、`==螢光==`、`[TOC]`… 在 HackMD 寫的筆記可以直接搬過來
 - **中文優先**：中文字型依需求從系統載入、段落首行縮排、中文換行不多出空白
+- **Android 版**（實驗性）：同一份程式編成 APK，在手機上用書本模式看小說，見 [`crates/shosai-android`](crates/shosai-android)
 
 | 閱讀模式 | 分割模式 |
 |---|---|
@@ -279,7 +280,9 @@ crates/
 │   │   ├── pdf.rs        內嵌 Typst 編譯成 PDF
 │   │   └── html.rs       單檔 HTML 輸出
 │   └── sync.rs           Nextcloud WebDAV 同步
-└── shosai/               GUI（egui）與命令列
+├── shosai-android/       Android 版的進入點與打包設定（程式本體在 shosai 裡）
+└── shosai/               GUI（egui）與命令列；函式庫（lib.rs）＋桌面版執行檔（main.rs）
+    ├── android.rs        Android 版的啟動流程：書庫位置、範例書、閃退紀錄
     ├── md_view.rs        GUI 的 Markdown 渲染器
     ├── find.rs           文件內尋找與取代
     ├── scroll_map.rs     原始文字位置 ↔ 畫面位置（捲動同步、大綱、跳轉共用）

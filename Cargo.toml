@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/shosai-core", "crates/shosai"]
+members = ["crates/shosai-core", "crates/shosai", "crates/shosai-android"]
 
 [workspace.package]
 version = "0.1.0"

@@ -234,6 +234,8 @@ pub struct NovelView {
     /// 目前這一章的內容（路徑、修改時間、段落）
     blocks: Option<(PathBuf, Option<SystemTime>, Vec<NBlock>)>,
     pub show_toc: bool,
+    /// 手機版：畫面窄，工具列與狀態列只放最常用的，目錄開啟時蓋滿整個畫面
+    pub compact: bool,
     /// 目錄要捲到目前這一章：`Some(Center)` 置中（剛打開目錄），`None` 只在看不到時才捲（翻到下一章）
     toc_scroll: Option<Option<Align>>,
     /// 目錄中收合起來的卷
@@ -250,6 +252,8 @@ pub struct NovelView {
     wheel_at: f64,
     /// 讀完最後一頁時短暫顯示提示
     end_flash: Option<std::time::Instant>,
+    /// 手指（或滑鼠）按著拖了多遠；放開時用來判斷是不是滑動翻頁
+    swipe: egui::Vec2,
 }
 
 impl NovelView {
@@ -272,6 +276,7 @@ impl NovelView {
             hurry: false,
             blocks: None,
             show_toc: false,
+            compact: false,
             toc_scroll: Some(Some(Align::Center)),
             collapsed: HashSet::new(),
             words: HashMap::new(),
@@ -281,6 +286,7 @@ impl NovelView {
             wheel: 0.0,
             wheel_at: 0.0,
             end_flash: None,
+            swipe: egui::Vec2::ZERO,
         }
     }
 
@@ -585,6 +591,18 @@ impl NovelView {
         if pages == 0 {
             return (left, String::new());
         }
+        if self.compact {
+            // 手機的狀態列很短：只留這一章的名字、頁數與全書進度
+            let left = match self.unit {
+                Unit::Front => self.book.title.clone(),
+                Unit::Chapter(i) => self.book.chapters[i].title.clone(),
+            };
+            let mut right = format!("{} / {} 頁", self.page + 1, pages);
+            if self.unit != Unit::Front {
+                right.push_str(&format!("　·　{:.0}%", self.progress() * 100.0));
+            }
+            return (left, right);
+        }
         let mut right = vec![format!("{} / {} 頁", self.page + 1, pages)];
         match self.unit {
             Unit::Front => right.push(format!("共 {} 章", self.book.chapters.len())),
@@ -632,6 +650,10 @@ impl NovelView {
                 }
             }
         });
+        // 手機的工具列放不下那麼多按鈕：雙頁留在「文字設定」裡，字級用裡面的拉條調
+        if self.compact {
+            return;
+        }
         ui.add_space(4.0);
         let tip = if prefs.spread { "改為單頁" } else { "改為雙頁（視窗夠寬時）" };
         let resp = icons::button(ui, if prefs.spread { Icon::Spread } else { Icon::FitPage }, tip);
@@ -658,7 +680,13 @@ impl NovelView {
             });
             ui.checkbox(&mut prefs.para_gap, "段落之間空半行");
             ui.checkbox(&mut prefs.turn_anim, "翻頁動畫");
+            if self.compact {
+                ui.checkbox(&mut prefs.spread, "橫放時左右兩頁並排");
+            }
         });
+        if self.compact {
+            return;
+        }
         if icons::button(ui, Icon::Plus, "放大字級（Ctrl+=）").clicked() {
             prefs.font_size = (prefs.font_size + 1.0).min(32.0);
         }
@@ -681,6 +709,16 @@ impl NovelView {
             // 下次打開目錄時，目前這一章要看得到
             self.toc_scroll = Some(Some(Align::Center));
             self.expand_current_volume();
+        } else if self.compact {
+            // 手機：旁邊放不下目錄，整個畫面都給它；選了一章（或按返回、Esc）就收起來
+            if ui.input(|i| i.key_pressed(Key::BrowserBack) || i.key_pressed(Key::Escape)) {
+                self.show_toc = false;
+            }
+            egui::Frame::new()
+                .fill(pal.chrome)
+                .inner_margin(egui::Margin::symmetric(14, 12))
+                .show(ui, |ui| self.toc_panel(ui, pal));
+            return;
         } else {
             egui::Panel::left("novel-toc")
                 .show_separator_line(false)
@@ -691,7 +729,8 @@ impl NovelView {
         }
         let area = ui.available_rect_before_wrap();
         ui.painter().rect_filled(area, 0.0, pal.desk);
-        let resp = ui.allocate_rect(area, Sense::click());
+        // 手機版另外接受拖曳，才分得出「滑動翻頁」；桌面版維持只有點擊
+        let resp = ui.allocate_rect(area, if self.compact { Sense::click_and_drag() } else { Sense::click() });
 
         // 頁面大小：B6 左右的比例，視窗夠寬才並排兩頁
         let outer = area.shrink2(vec2(20.0, 18.0));
@@ -766,12 +805,14 @@ impl NovelView {
         }
 
         // 目錄頁的連結
-        let hover_link = ui.input(|i| i.pointer.hover_pos()).and_then(|p| links.iter().find(|(r, _)| r.contains(p)));
+        let link_at = |p: Option<egui::Pos2>| p.and_then(|p| links.iter().find(|(r, _)| r.contains(p)));
+        let hover_link = link_at(ui.input(|i| i.pointer.hover_pos()));
         if let Some((r, _)) = hover_link {
             ui.painter().rect_filled(r.expand(2.0), 4.0, pal.hover);
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
-        let clicked_link = resp.clicked().then_some(hover_link).flatten().map(|(_, i)| *i);
+        // 點在哪裡要另外問：手指放開的那一幀已經沒有「游標位置」了
+        let clicked_link = if resp.clicked() { link_at(resp.interact_pointer_pos()).map(|(_, i)| *i) } else { None };
 
         // 進度條
         let bar_y = area.bottom() - 7.0;
@@ -821,9 +862,33 @@ impl NovelView {
                 }
             }
         }
+        // 手機：左右滑動翻頁。像撥紙一樣，往哪邊滑，紙就往哪邊走
+        // （橫排的下一頁在右邊，要往左撥；直排相反）
+        if let Some(d) = resp.total_drag_delta() {
+            self.swipe = d;
+        }
+        if resp.drag_stopped() {
+            let d = std::mem::take(&mut self.swipe);
+            if swipe_turns(d) {
+                if (d.x < 0.0) != prefs.vertical {
+                    self.next_page(spread)
+                } else {
+                    self.prev_page(spread)
+                }
+            }
+        }
         if self.turn.is_some() {
             // 只有動畫播放中才連續重畫；播完就停
             ui.ctx().request_repaint();
+        }
+    }
+
+    /// 手機的返回鍵：目錄開著就先關目錄，否則結束書本模式。
+    fn back(&mut self, events: &mut Vec<NovelEvent>) {
+        if self.show_toc {
+            self.show_toc = false;
+        } else {
+            events.push(NovelEvent::Close);
         }
     }
 
@@ -1000,6 +1065,9 @@ impl NovelView {
             if toc {
                 self.show_toc = !self.show_toc;
             }
+            if ui.input(|i| i.key_pressed(Key::BrowserBack)) {
+                self.back(events);
+            }
         }
         if resp.contains_pointer() {
             // 直接讀原始的滾輪事件：滑鼠滾輪一格就翻一頁，不必等平滑捲動慢慢累積。
@@ -1120,6 +1188,9 @@ impl NovelView {
         }
         if let Some(u) = goto {
             self.go(u, Want::First);
+            if self.compact {
+                self.show_toc = false;
+            }
         }
     }
 
@@ -1947,6 +2018,11 @@ fn rotated(p: &egui::Painter, text: &str, center: egui::Pos2, size: f32, color: 
     p.add(Shape::Text(shape));
 }
 
+/// 按著拖了 `d` 之後放開，算不算「左右滑動翻頁」：要夠長，而且明顯是橫的。
+fn swipe_turns(d: egui::Vec2) -> bool {
+    d.x.abs() >= 36.0 && d.x.abs() >= 1.5 * d.y.abs()
+}
+
 /// 把這一幀的滾輪量加進累積量 `acc`（單位：頁），回傳現在要翻幾頁（負值往後翻，正值往回翻）。
 ///
 /// `lines` 是滑鼠滾輪的格數：一格一頁，同一幀滾了幾格就翻幾頁。
@@ -2213,6 +2289,22 @@ one two three four five six
             panic!("the view never came to rest");
         }
 
+        /// 按著從 `from` 拖到 `to` 再放開（手指滑動也是這樣進來的）。
+        fn drag(&mut self, from: egui::Pos2, to: egui::Pos2) {
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let dt = 1.0 / 60.0;
+            self.frame(dt, vec![egui::Event::PointerMoved(from), button(from, true)]);
+            for i in 1..=4 {
+                self.frame(dt, vec![egui::Event::PointerMoved(from + (to - from) * (i as f32 / 4.0))]);
+            }
+            self.frame(dt, vec![button(to, false)]);
+        }
+
         /// 按下按鍵不放。同一個鍵沒放開又按一次，egui 就當成按住時系統送來的重複按鍵。
         fn hold(&mut self, key: Key) {
             self.key(key, true);
@@ -2261,6 +2353,44 @@ one two three four five six
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn swiping_sideways_turns_the_page() {
+        let mut s = Stage::new("swipe");
+        s.v.compact = true;
+        s.settle();
+        let mid = STAGE.to_pos2() / 2.0;
+        // 直排的下一頁在左邊：往右撥
+        s.drag(mid, mid + vec2(120.0, 10.0));
+        s.settle();
+        assert_eq!(s.at(), (Unit::Chapter(0), 2), "swiping right goes forward in a vertical book");
+        s.drag(mid, mid + vec2(-120.0, -10.0));
+        s.settle();
+        assert_eq!(s.at(), (Unit::Chapter(0), 0), "swiping left goes back");
+        // 太短、或其實是上下拖的，都不算；也不會被當成點一下而打開目錄
+        s.drag(mid, mid + vec2(20.0, 0.0));
+        s.drag(mid, mid + vec2(40.0, 160.0));
+        s.settle();
+        assert_eq!(s.at(), (Unit::Chapter(0), 0));
+        assert!(!s.v.show_toc, "a drag is not a tap");
+
+        // 桌面版用滑鼠拖頁面不會翻頁
+        s.v.compact = false;
+        s.settle();
+        s.drag(mid, mid + vec2(120.0, 0.0));
+        s.settle();
+        assert_eq!(s.at(), (Unit::Chapter(0), 0), "dragging with the mouse does nothing on desktop");
+        s.v.compact = true;
+        s.settle();
+
+        // 橫排相反：下一頁在右邊，往左撥
+        s.prefs.vertical = false;
+        s.settle();
+        let before = s.at();
+        s.drag(mid, mid + vec2(-120.0, 0.0));
+        s.settle();
+        assert_eq!(s.at(), (before.0, before.1 + 2), "swiping left goes forward in a horizontal book");
     }
 
     #[test]

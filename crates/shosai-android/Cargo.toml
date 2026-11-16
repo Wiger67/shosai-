@@ -1,0 +1,33 @@
+[package]
+name = "shosai-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# 手機版只拿來閱讀：不帶 Typst PDF 引擎（省下約 21 MB）
+shosai = { path = "../shosai", default-features = false }
+
+[package.metadata.android]
+package = "app.shosai"
+apk_name = "shosai"
+build_targets = ["aarch64-linux-android"]
+resources = "res"
+
+[package.metadata.android.sdk]
+min_sdk_version = 26
+target_sdk_version = 34
+
+# 讀取內部儲存空間的 Shosai 資料夾（要在系統設定裡手動允許「所有檔案存取權」）
+[[package.metadata.android.uses_permission]]
+name = "android.permission.MANAGE_EXTERNAL_STORAGE"
+
+[package.metadata.android.application]
+label = "書齋"
+icon = "@mipmap/ic_launcher"
+# 全螢幕：隱藏狀態列，畫面不會跑到前鏡頭底下
+theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"

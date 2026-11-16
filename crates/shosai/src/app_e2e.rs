@@ -49,7 +49,8 @@ impl Harness {
         std::fs::write(dir.join("doc.md"), &text).unwrap();
         let ctx = egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-        let mut app = ShosaiApp::new(&cc, Some(dir.join("doc.md")));
+        let startup = Startup { open: Some(dir.join("doc.md")), ..Default::default() };
+        let mut app = ShosaiApp::new(&cc, startup);
         app.settings.view = view;
         assert!(app.doc.is_some(), "the document opened");
         let mut h = Harness {
@@ -431,4 +432,225 @@ fn nothing_keeps_repainting_when_idle() {
     h.key(Key::Enter, Modifiers::NONE);
     h.run(120);
     assert!(h.repaint_after > idle, "reader: {:?} {:?}", h.repaint_after, h.ctx.repaint_causes());
+}
+
+/// 手機大小的畫面：Galaxy S25 直放（1080×2340、縮放 3 倍 → 360×780 點）。
+const PHONE: egui::Vec2 = vec2(360.0, 780.0);
+/// 存圖時一點畫幾個像素。
+const PHONE_PPP: f32 = 2.0;
+/// 系統導覽列佔掉最下面的這麼多點。
+const PHONE_NAV_BAR: f32 = 24.0;
+
+/// 以手機版的介面把整個程式跑起來。
+struct Phone {
+    ctx: egui::Context,
+    app: ShosaiApp,
+    frame: eframe::Frame,
+    textures: crate::shot::Textures,
+    shapes: Vec<egui::epaint::ClippedShape>,
+    time: f64,
+    dir: PathBuf,
+}
+
+impl Phone {
+    /// 書庫裡有兩本書，各兩章。
+    fn new(name: &str) -> Phone {
+        let dir = std::env::temp_dir().join(format!("shosai-e2e-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for book in ["雨夜的茶館", "星海航路"] {
+            std::fs::create_dir_all(dir.join(book)).unwrap();
+            for (file, title) in [("1.md", "第一章　出發"), ("2.md", "第二章　歸途")] {
+                let mut text = format!(
+                    "# {title}
+
+"
+                );
+                for i in 0..60 {
+                    text.push_str(&"那一天的雨下得很久，他在窗邊等了一個下午。".repeat(1 + i % 3));
+                    text.push_str(
+                        "「還要多久？」她問，手裡的茶已經涼了。｜茶館《ちゃかん》裡只剩下他們兩個人。
+
+",
+                    );
+                }
+                std::fs::write(dir.join(book).join(file), text).unwrap();
+            }
+        }
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        // 系統回報的範圍是實體像素
+        let content_rect: ContentRect =
+            Box::new(|| [0.0, 0.0, PHONE.x * PHONE_PPP, (PHONE.y - PHONE_NAV_BAR) * PHONE_PPP]);
+        let startup = Startup {
+            library: Some(dir.clone()),
+            mobile: true,
+            content_rect: Some(content_rect),
+            ..Default::default()
+        };
+        let mut app = ShosaiApp::new(&cc, startup);
+        // 手機上的預設值（在電腦上跑測試時 `Settings::default()` 給的是桌面版的）
+        app.settings.sidebar = false;
+        app.settings.view = ViewMode::Read;
+        app.settings.dark = Some(false);
+        let mut phone = Phone {
+            ctx,
+            app,
+            frame: eframe::Frame::_new_kittest(),
+            textures: Default::default(),
+            shapes: Vec::new(),
+            time: 0.0,
+            dir,
+        };
+        phone.settle();
+        phone
+    }
+
+    /// 跑一幀，送入這些事件。
+    fn step(&mut self, events: Vec<Event>) {
+        self.time += 1.0 / 30.0;
+        let mut input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, PHONE)),
+            time: Some(self.time),
+            events,
+            ..Default::default()
+        };
+        input.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(PHONE_PPP);
+        self.app.raw_input_hook(&self.ctx, &mut input);
+        let mut out = self.ctx.run_ui(input, |ui| self.app.ui(ui, &mut self.frame));
+        self.textures.update(&mut out.textures_delta);
+        self.shapes = out.shapes;
+    }
+
+    /// 排版、背景的字數統計、翻頁動畫都跑完。
+    fn settle(&mut self) {
+        for _ in 0..40 {
+            self.step(Vec::new());
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// 手指點一下。
+    fn tap(&mut self, at: Pos2) {
+        let button = |pressed| Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        self.step(vec![Event::PointerMoved(at), button(true)]);
+        self.step(vec![button(false), Event::PointerGone]);
+        self.settle();
+    }
+
+    /// 手機的返回鍵。
+    fn back(&mut self) {
+        let key = |pressed| Event::Key {
+            key: Key::BrowserBack,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        self.step(vec![key(true)]);
+        self.step(vec![key(false)]);
+        self.settle();
+    }
+
+    /// 書本模式現在在哪一頁。
+    fn page(&self) -> Option<(PathBuf, usize)> {
+        self.app.novel.as_ref().and_then(|n| n.position())
+    }
+
+    /// 把現在的畫面存成 `target/shots/` 裡的圖片。
+    fn save(&self, name: &str) {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/shots").join(name);
+        let size = [(PHONE.x * PHONE_PPP) as usize, (PHONE.y * PHONE_PPP) as usize];
+        self.textures.save(&self.ctx, self.shapes.clone(), size, &path);
+    }
+}
+
+impl Drop for Phone {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// 手機版：書櫃 → 點一本書 → 點兩側翻頁、點中間開目錄 → 返回鍵一路退回書櫃。
+#[test]
+fn phone_reads_a_book_by_touch() {
+    let mut p = Phone::new("phone");
+    assert!(p.app.novel.is_none() && p.app.doc.is_none(), "starts on the bookshelf");
+    // 畫面要避開系統導覽列：最下面那一條不能有任何會接收點擊的東西
+    let safe = p.ctx.content_rect();
+    assert_eq!(safe.bottom(), PHONE.y - PHONE_NAV_BAR, "the navigation bar is kept clear");
+
+    // 書櫃上的第一本書
+    p.tap(pos2(PHONE.x * 0.5, 350.0));
+    assert!(p.app.novel.is_some(), "tapping a book opens it in book mode");
+    assert_eq!(p.page(), None, "a book opens on its cover");
+    // 直排：點左邊是下一頁。封面 → 目錄 → 第一章
+    let left = pos2(PHONE.x * 0.1, PHONE.y * 0.5);
+    p.tap(left);
+    p.tap(left);
+    let first = p.page().expect("two taps past the cover and contents reach the first chapter");
+    assert_eq!(first.1, 0, "at the start of the chapter");
+    p.tap(left);
+    let second = p.page().expect("still in the chapter");
+    assert!(second.0 == first.0 && second.1 > 0, "tapping the left edge turns the page: {second:?}");
+    // 點右邊往回
+    p.tap(pos2(PHONE.x * 0.9, PHONE.y * 0.5));
+    assert_eq!(p.page(), Some(first), "tapping the right edge goes back");
+
+    // 書裡的目錄頁（封面的下一頁）：點章名就跳到那一章
+    p.tap(pos2(PHONE.x * 0.9, PHONE.y * 0.5));
+    p.tap(pos2(PHONE.x * 0.9, PHONE.y * 0.5));
+    assert_eq!(p.page(), None, "back on the cover");
+    p.tap(left);
+    assert_eq!(p.page(), None, "the contents page is still front matter");
+    // 直排由右往左：第一欄是「目錄」兩個字，接著是第一章、第二章
+    p.tap(pos2(194.5, 170.0));
+    let jumped = p.page().expect("tapping a chapter on the contents page opens it");
+    assert!(jumped.0.ends_with("2.md") && jumped.1 == 0, "the second chapter: {jumped:?}");
+
+    // 點中間開目錄；返回鍵先關目錄，再回書櫃
+    p.tap(pos2(PHONE.x * 0.5, PHONE.y * 0.5));
+    assert!(p.app.novel.as_ref().is_some_and(|n| n.show_toc), "tapping the middle opens the contents");
+    // 狀態列在導覽列上方，而且文字不會長到左右疊在一起
+    let (left, right) = p.app.novel.as_ref().unwrap().status();
+    assert!(left.chars().count() + right.chars().count() < 30, "a short status line: {left} | {right}");
+    p.back();
+    assert!(p.app.novel.as_ref().is_some_and(|n| !n.show_toc), "back closes the contents first");
+    p.back();
+    assert!(p.app.novel.is_none() && p.app.doc.is_none(), "back again returns to the bookshelf");
+}
+
+/// 把手機版的幾個畫面存成圖片（`target/shots/mobile-*.png`），用眼睛檢查版面：
+/// `cargo test -p shosai mobile_shots -- --ignored`
+#[test]
+#[ignore = "writes PNGs for looking at; run by hand"]
+fn mobile_shots() {
+    let mut p = Phone::new("mobile-shots");
+    // 測試環境沒有中文字型（程式執行時由系統字型補上）：找得到就裝一個，圖片裡才看得到字
+    if let Ok(bytes) = std::fs::read("C:/Windows/Fonts/msjh.ttc") {
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert("cjk".into(), egui::FontData::from_owned(bytes).into());
+        fonts.families.entry(egui::FontFamily::Proportional).or_default().push("cjk".into());
+        p.ctx.set_fonts(fonts);
+    }
+    p.settle();
+    p.save("mobile-1-shelf.png");
+    p.tap(pos2(PHONE.x * 0.5, 350.0));
+    p.save("mobile-2-cover.png");
+    for _ in 0..3 {
+        p.tap(pos2(PHONE.x * 0.1, PHONE.y * 0.5));
+    }
+    p.save("mobile-3-vertical.png");
+    p.app.settings.novel.vertical = false;
+    p.settle();
+    p.save("mobile-4-horizontal.png");
+    p.tap(pos2(PHONE.x * 0.5, PHONE.y * 0.5));
+    p.save("mobile-5-toc.png");
+    p.app.settings.dark = Some(true);
+    p.back();
+    p.save("mobile-6-dark.png");
 }

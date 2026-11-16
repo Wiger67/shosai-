@@ -21,7 +21,42 @@ use crate::scroll_map;
 use crate::theme::{self, Palette};
 use crate::tree::{self, DragItem, Place, TreeCtx, TreeNav};
 
+/// 啟動時要做的事。桌面版只有 `open`，其餘是手機版用的。
+#[derive(Default)]
+pub struct Startup {
+    /// 命令列指定要開啟的資料夾或檔案
+    pub open: Option<PathBuf>,
+    /// 固定使用這個書庫（手機版沒有檔案對話框可以選）
+    pub library: Option<PathBuf>,
+    /// 沒有上次的閱讀狀態時，直接用書本模式開這個資料夾
+    pub novel: Option<PathBuf>,
+    /// 一開啟就顯示的訊息（手機版：上次意外結束的原因）
+    pub report: Option<String>,
+    /// 系統列以外可以畫東西的範圍（左、上、右、下，實體像素）。
+    /// 手機上視窗蓋滿整個螢幕，要自己避開導覽列。
+    pub content_rect: Option<ContentRect>,
+    /// 手機版的介面：首頁是書櫃、工具列精簡、結束書本模式就回書櫃
+    pub mobile: bool,
+}
+
+pub type ContentRect = Box<dyn Fn() -> [f32; 4]>;
+
+/// 在手機上執行：畫面窄、用手指操作、只拿來閱讀（決定設定的預設值）。
+const MOBILE: bool = cfg!(target_os = "android");
+
+#[cfg(target_os = "android")]
+pub fn run_android(
+    android_app: crate::android::AndroidApp,
+    startup: Startup,
+    storage: Option<PathBuf>,
+) -> eframe::Result {
+    let options =
+        eframe::NativeOptions { android_app: Some(android_app), persistence_path: storage, ..Default::default() };
+    eframe::run_native("shosai", options, Box::new(move |cc| Ok(Box::new(ShosaiApp::new(cc, startup)))))
+}
+
 pub fn run(open: Option<PathBuf>) -> eframe::Result {
+    let startup = Startup { open, ..Default::default() };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("書齋")
@@ -34,7 +69,7 @@ pub fn run(open: Option<PathBuf>) -> eframe::Result {
         ..Default::default()
     };
     crate::trace("run_native");
-    eframe::run_native("shosai", options, Box::new(move |cc| Ok(Box::new(ShosaiApp::new(cc, open)))))
+    eframe::run_native("shosai", options, Box::new(move |cc| Ok(Box::new(ShosaiApp::new(cc, startup)))))
 }
 
 /// 視窗 / 工作列圖示。
@@ -102,12 +137,12 @@ impl Default for Settings {
             library_root: None,
             last_file: None,
             recent_libraries: Vec::new(),
-            view: ViewMode::Split,
+            view: if MOBILE { ViewMode::Read } else { ViewMode::Split },
             dark: None,
             editor_size: 15.0,
             reader_size: 17.0,
             reader_width: 720.0,
-            sidebar: true,
+            sidebar: !MOBILE,
             expanded: HashSet::new(),
             ui_scale: 1.0,
             editor_proportional: false,
@@ -267,6 +302,8 @@ pub(crate) enum Dialog {
     },
     /// 同步結果
     Report(String),
+    /// 上次意外結束的原因（手機版）
+    Crash(String),
     Shortcuts,
 }
 
@@ -344,6 +381,10 @@ pub struct ShosaiApp {
     novel: Option<NovelView>,
     /// 視窗的位置、大小與是否最大化
     window: crate::window::WindowMemory,
+    /// 手機版：系統列以外可以畫東西的範圍
+    content_rect: Option<ContentRect>,
+    /// 手機版的介面
+    mobile: bool,
     /// 檔案樹的鍵盤操作
     tree_nav: TreeNav,
     novel_titles: shosai_core::novel::TitleCache,
@@ -472,7 +513,8 @@ impl SettingsTab {
 }
 
 impl ShosaiApp {
-    fn new(cc: &eframe::CreationContext<'_>, open: Option<PathBuf>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, startup: Startup) -> Self {
+        let Startup { open, library: fixed_library, novel: first_novel, report, content_rect, mobile } = startup;
         crate::trace("window + GL ready");
         egui_extras::install_image_loaders(&cc.egui_ctx);
         theme::install(&cc.egui_ctx);
@@ -518,7 +560,13 @@ impl ShosaiApp {
             watcher: None,
             novel: None,
             window: crate::window::WindowMemory::load(cc.storage),
+            content_rect,
+            mobile,
         };
+        app.dialog = report.map(Dialog::Crash);
+        if let Some(root) = fixed_library {
+            app.settings.library_root = Some(root);
+        }
 
         // 決定開啟的書庫與檔案：命令列參數 > 上次狀態
         let open = open.and_then(|p| p.canonicalize().ok());
@@ -546,6 +594,11 @@ impl ShosaiApp {
                     {
                         app.open_novel(&novel, None);
                         crate::trace("open_novel");
+                    }
+                    if app.novel.is_none() && app.doc.is_none() {
+                        if let Some(novel) = first_novel.filter(|d| d.is_dir()) {
+                            app.open_novel(&novel, None);
+                        }
                     }
                 }
             }
@@ -636,7 +689,9 @@ impl ShosaiApp {
             },
             None => saved,
         };
-        self.novel = Some(NovelView::open(book, at));
+        let mut view = NovelView::open(book, at);
+        view.compact = self.mobile;
+        self.novel = Some(view);
         self.settings.novel_open = Some(root.to_path_buf());
     }
 
@@ -990,17 +1045,7 @@ impl ShosaiApp {
             Err(e) => return self.error(e),
         };
         let default = crate::cli::default_output(&source, &doc.title, format.ext());
-        let mut dialog = rfd::FileDialog::new()
-            .set_title(format!("輸出 {}", format.label()))
-            .add_filter(format.label(), &[format.ext()])
-            .set_file_name(default.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
-        if let Some(dir) = default.parent() {
-            dialog = dialog.set_directory(dir);
-        }
-        let Some(mut out) = dialog.save_file() else { return };
-        if out.extension().is_none() {
-            out.set_extension(format.ext());
-        }
+        let Some(out) = pick_output(&default, format) else { return };
 
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
@@ -1140,7 +1185,7 @@ impl ShosaiApp {
                     self.open_library(&p);
                 }
                 Action::PickLibrary => {
-                    if let Some(dir) = rfd::FileDialog::new().set_title("選擇書庫資料夾").pick_folder() {
+                    if let Some(dir) = pick_folder() {
                         self.save_current();
                         self.doc = None;
                         self.pdf = None;
@@ -1393,6 +1438,11 @@ impl ShosaiApp {
     fn handle_novel_events(&mut self, events: Vec<NovelEvent>) {
         for ev in events {
             match ev {
+                // 手機版沒有一般的閱讀畫面可回，直接回到書櫃
+                NovelEvent::Close if self.mobile => {
+                    self.close_novel(false);
+                    self.doc = None;
+                }
                 NovelEvent::Close => self.close_novel(true),
             }
         }
@@ -2414,6 +2464,8 @@ impl ShosaiApp {
                         }
                     }
                 }
+            } else if self.mobile {
+                self.bookshelf(ui, pal);
             } else {
                 ui.label(RichText::new("從左側選一個檔案開始，或按 + 新增筆記、建立書本").color(pal.weak));
                 ui.add_space(16.0);
@@ -2422,6 +2474,49 @@ impl ShosaiApp {
                     ui.label(RichText::new(format!("{k}　{v}")).small().color(pal.weak));
                 }
             }
+        });
+    }
+
+    /// 手機版的首頁：書庫最上層的每個資料夾是一本書，點一下就用書本模式打開。
+    fn bookshelf(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        let Some(lib) = &self.library else { return };
+        let books: Vec<(PathBuf, String)> = lib
+            .entries
+            .iter()
+            .filter(|e| matches!(e.kind, EntryKind::Dir | EntryKind::Book))
+            .map(|e| (e.path.clone(), e.name.clone()))
+            .collect();
+        let loose = lib.entries.iter().any(|e| e.kind == EntryKind::Markdown);
+        let root = lib.root.clone();
+        let width = (ui.available_width() - 48.0).clamp(120.0, 320.0);
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.spacing_mut().item_spacing.y = 8.0;
+                let mut shelf = |ui: &mut egui::Ui, label: &str, path: &Path| {
+                    let button = egui::Button::new(RichText::new(label).size(16.0))
+                        .corner_radius(8)
+                        .min_size(egui::vec2(width, 44.0));
+                    if ui.add(button.fill(pal.hover)).clicked() {
+                        self.actions.push(Action::OpenNovel { root: path.to_path_buf(), chapter: None });
+                    }
+                };
+                for (path, name) in &books {
+                    shelf(ui, name, path);
+                }
+                if loose {
+                    shelf(ui, "（沒有分類的章節）", &root);
+                }
+                ui.add_space(16.0);
+                let hint = if books.is_empty() && !loose { "書庫裡還沒有書。\n" } else { "" };
+                let note = |ui: &mut egui::Ui, text: String| ui.label(RichText::new(text).small().color(pal.weak));
+                note(
+                    ui,
+                    format!("{hint}把小說資料夾放進手機的「Shosai」資料夾，\n並在系統設定允許書齋「所有檔案存取權」。"),
+                );
+                ui.add_space(4.0);
+                note(ui, "目前的書庫".to_string());
+                note(ui, root.display().to_string());
+            });
         });
     }
 
@@ -2703,8 +2798,9 @@ impl ShosaiApp {
         let mut keep = true;
         let mut confirm = false;
 
+        let crash = matches!(dialog, Dialog::Crash(_));
         let modal = egui::Modal::new(egui::Id::unique("shosai-dialog")).show(ctx, |ui| {
-            ui.set_min_width(360.0);
+            ui.set_min_width(360.0_f32.min(ctx.content_rect().width() - 48.0));
             ui.spacing_mut().item_spacing.y = 8.0;
             let enter = ui.input(|i| i.key_pressed(Key::Enter));
             let title = |ui: &mut egui::Ui, t: &str| {
@@ -2773,8 +2869,8 @@ impl ShosaiApp {
                             .color(pal.weak),
                     );
                 }
-                Dialog::Report(report) => {
-                    title(ui, "同步完成");
+                Dialog::Report(report) | Dialog::Crash(report) => {
+                    title(ui, if crash { "上次沒有正常結束" } else { "同步完成" });
                     egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                         ui.label(RichText::new(report.as_str()).monospace());
                     });
@@ -2817,7 +2913,7 @@ impl ShosaiApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (label, danger) = match &dialog {
                     Dialog::Trash { .. } => ("移除", true),
-                    Dialog::Report(_) | Dialog::Shortcuts => ("關閉", false),
+                    Dialog::Report(_) | Dialog::Crash(_) | Dialog::Shortcuts => ("關閉", false),
                     Dialog::BookSettings { .. } => ("儲存", false),
                     _ => ("確定", false),
                 };
@@ -2828,7 +2924,7 @@ impl ShosaiApp {
                 if ui.add(primary).clicked() {
                     confirm = true;
                 }
-                if !matches!(dialog, Dialog::Report(_) | Dialog::Shortcuts)
+                if !matches!(dialog, Dialog::Report(_) | Dialog::Crash(_) | Dialog::Shortcuts)
                     && ui.add(egui::Button::new("取消").min_size(egui::vec2(64.0, 28.0))).clicked()
                 {
                     keep = false;
@@ -2934,7 +3030,7 @@ impl ShosaiApp {
             }
             #[cfg(not(feature = "nextcloud"))]
             Dialog::Nextcloud { .. } => {}
-            Dialog::Report(_) | Dialog::Shortcuts => {}
+            Dialog::Report(_) | Dialog::Crash(_) | Dialog::Shortcuts => {}
         }
         Ok(())
     }
@@ -2946,7 +3042,9 @@ impl eframe::App for ShosaiApp {
         if self.first_frame {
             crate::trace("first ui() start");
         }
-        self.window.track(&ctx);
+        if !self.mobile {
+            self.window.track(&ctx);
+        }
         self.sync.wheel = ctx.input(|i| i.smooth_scroll_delta != egui::Vec2::ZERO);
         self.apply_theme(&ctx);
         self.shortcuts(&ctx);
@@ -2955,6 +3053,25 @@ impl eframe::App for ShosaiApp {
             self.on_fs_change(changed);
         }
         let pal = theme::palette(ui.visuals().dark_mode);
+
+        // 手機：視窗蓋滿整個螢幕，系統導覽列（與瀏海）佔掉的邊緣留白，介面排在它們以內
+        let (full, safe) = (ctx.viewport_rect(), ctx.content_rect());
+        let edges = [
+            (egui::Panel::top("safe-top"), safe.top() - full.top()),
+            (egui::Panel::bottom("safe-bottom"), full.bottom() - safe.bottom()),
+            (egui::Panel::left("safe-left"), safe.left() - full.left()),
+            (egui::Panel::right("safe-right"), full.right() - safe.right()),
+        ];
+        for (panel, size) in edges {
+            if size > 0.5 {
+                panel
+                    .exact_size(size)
+                    .resizable(false)
+                    .show_separator_line(false)
+                    .frame(egui::Frame::new().fill(pal.chrome))
+                    .show(ui, |_| {});
+            }
+        }
 
         egui::Panel::top("toolbar")
             .show_separator_line(false)
@@ -3136,6 +3253,25 @@ impl eframe::App for ShosaiApp {
         }
     }
 
+    /// 手機版：把系統導覽列佔掉的邊緣告訴 egui，面板就不會排到它底下。
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        let (Some(content_rect), Some(screen)) = (&self.content_rect, raw.screen_rect) else { return };
+        let [left, top, right, bottom] = content_rect();
+        if right <= left || bottom <= top {
+            return; // 系統還沒回報
+        }
+        let ppp = ctx.pixels_per_point();
+        // 回報的數字不合理（超過畫面的五分之一）就不理它，免得整個畫面被擠掉
+        let inset = |px: f32, full: f32| (px / ppp).clamp(0.0, full * 0.2);
+        let (w, h) = (screen.width(), screen.height());
+        raw.safe_area_insets = Some(egui::SafeAreaInsets(egui::epaint::MarginF32 {
+            left: inset(left, w),
+            top: inset(top, h),
+            right: inset(w * ppp - right, w),
+            bottom: inset(h * ppp - bottom, h),
+        }));
+    }
+
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, &self.settings);
         // eframe 剛寫過視窗狀態，但縮到工作列時它會記錯，換成自己記的
@@ -3304,6 +3440,40 @@ fn wrap_selection(text: &mut String, a: usize, b: usize, open: &str, close: &str
         text.insert_str(ba, open);
         (a + ol, b + ol)
     }
+}
+
+/// 問使用者要輸出到哪裡。
+#[cfg(not(target_os = "android"))]
+fn pick_output(default: &Path, format: Format) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new()
+        .set_title(format!("輸出 {}", format.label()))
+        .add_filter(format.label(), &[format.ext()])
+        .set_file_name(default.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+    if let Some(dir) = default.parent() {
+        dialog = dialog.set_directory(dir);
+    }
+    let mut out = dialog.save_file()?;
+    if out.extension().is_none() {
+        out.set_extension(format.ext());
+    }
+    Some(out)
+}
+
+/// 手機上沒有檔案對話框：直接輸出到預設的位置（書本資料夾裡、或原檔旁邊）。
+#[cfg(target_os = "android")]
+fn pick_output(default: &Path, _format: Format) -> Option<PathBuf> {
+    Some(default.to_path_buf())
+}
+
+#[cfg(not(target_os = "android"))]
+fn pick_folder() -> Option<PathBuf> {
+    rfd::FileDialog::new().set_title("選擇書庫資料夾").pick_folder()
+}
+
+/// 手機上書庫的位置是固定的（見 `android.rs`）。
+#[cfg(target_os = "android")]
+fn pick_folder() -> Option<PathBuf> {
+    None
 }
 
 fn mtime(path: &Path) -> Option<SystemTime> {
