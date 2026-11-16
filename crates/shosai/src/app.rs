@@ -1347,8 +1347,10 @@ impl ShosaiApp {
         }
         // Ctrl+滾輪：文字頁面調整字級（PDF 由檢視器自己以游標為中心縮放）
         if self.pdf.is_none() || self.novel.is_some() {
-            let delta = ctx.input(|i| i.zoom_delta());
-            if delta == 1.0 {
+            let (delta, pinch_at) = ctx.input(|i| (i.zoom_delta(), i.multi_touch().map(|m| m.center_pos)));
+            // 書本模式裡兩指撐開插圖是放大插圖，不是調字級
+            let pinching_image = pinch_at.is_some_and(|at| self.novel.as_ref().is_some_and(|n| n.claims_pinch(at)));
+            if delta == 1.0 || pinching_image {
                 self.wheel_zoom = 0.0;
             } else {
                 self.wheel_zoom += delta.ln();
