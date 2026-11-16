@@ -283,6 +283,7 @@ crates/
 ├── shosai-android/       Android 版的進入點與打包設定（程式本體在 shosai 裡）
 └── shosai/               GUI（egui）與命令列；函式庫（lib.rs）＋桌面版執行檔（main.rs）
     ├── android.rs        Android 版的啟動流程：書庫位置、範例書、閃退紀錄
+    ├── folder_picker.rs  手機版「選擇書庫資料夾」的畫面
     ├── md_view.rs        GUI 的 Markdown 渲染器
     ├── find.rs           文件內尋找與取代
     ├── scroll_map.rs     原始文字位置 ↔ 畫面位置（捲動同步、大綱、跳轉共用）

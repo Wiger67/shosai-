@@ -32,11 +32,30 @@ keytool -genkey -v -keystore "$env:USERPROFILE\.android\debug.keystore" -storepa
 
 ## 小說放哪裡
 
-書齋依序找這兩個地方：
+書庫是手機上的一個資料夾，裡面每個資料夾是一本書。
 
-1. **內部儲存空間最上層的 `Shosai` 資料夾**（`/storage/emulated/0/Shosai`）。裡面每個資料夾是一本書。
-   要到「設定 → 應用程式 → 書齋」（或「特殊存取權 → 所有檔案存取權」）允許書齋存取所有檔案才讀得到。
-2. 讀不到的話用 App 自己的資料夾 `Android/data/app.shosai/files`，不需要權限；第一次開啟會放一本範例書。
+**自己選**：在首頁（書櫃）按「選擇書庫資料夾…」，一層一層點進去，走到要當書庫的資料夾後按「用這個資料夾」。
+選過之後每次開啟都用它。要讀 App 自己以外的資料夾，得先到「設定 → 應用程式 → 書齋」
+（或「特殊存取權 → 所有檔案存取權」）允許書齋存取所有檔案，否則資料夾看起來會是空的。
+
+**沒選過的時候**，書齋依序找這兩個地方：
+
+1. 內部儲存空間最上層的 `Shosai` 資料夾（`/storage/emulated/0/Shosai`）。
+2. App 自己的資料夾 `Android/data/app.shosai/files`，不需要權限；第一次開啟會放一本範例書。
+
+## 和電腦同步（Nextcloud）
+
+書齋自己不連網路，同步交給 Nextcloud 的官方用戶端，書齋只負責讀同步下來的資料夾：
+
+1. **電腦**：讓書庫資料夾被 Nextcloud 桌面版同步到雲端。桌面版已經同步整個帳號（雲端的 `/`）時，
+   最直接的做法是把書庫放進它的同步資料夾裡，並在檔案總管對它按右鍵選「一律保留在此裝置」。
+2. **手機**：在 Nextcloud App 裡把那個資料夾下載（同步）到手機上。
+3. **書齋**：「選擇書庫資料夾…」→ 走到 Nextcloud App 存檔的資料夾 → 那個資料夾 →「用這個資料夾」。
+
+> 第 2、3 步還沒有在實機上確認過：Nextcloud App 的選單名稱、它把檔案存在哪裡
+> （預期是 `Android/media/com.nextcloud.client/nextcloud/<帳號>/`，選擇畫面上方有捷徑）、
+> 以及之後雲端的變動會不會自動下載，都以手機上看到的為準。
+> Nextcloud App 的「設定」裡看得到它的資料儲存位置。
 
 ## 操作
 
@@ -44,14 +63,14 @@ keytool -genkey -v -keystore "$env:USERPROFILE\.android\debug.keystore" -storepa
 - 點頁面左右兩側、或左右滑動翻頁；點中間開目錄（蓋滿整個畫面，選一章就收起來）
 - 返回鍵：關目錄 → 回到首頁
 - 工具列右邊的「Aa」可以調字級、行距、縮排、翻頁動畫
-- 閱讀進度存在手機上，不會和電腦同步
+- 首頁的「選擇書庫資料夾…」可以換書庫
 
 ## 不接手機也能檢查版面
 
 `shosai` 的測試會用手機的畫面大小（360×780 點）把整個程式跑起來：
 
 ```bash
-cargo test -p shosai phone_reads                 # 點書、翻頁、目錄、返回鍵
+cargo test -p shosai phone_                      # 點書、翻頁、目錄、返回鍵、選書庫資料夾
 cargo test -p shosai mobile_shots -- --ignored   # 把幾個畫面存成 target/shots/mobile-*.png
 ```
 
@@ -60,5 +79,5 @@ cargo test -p shosai mobile_shots -- --ignored   # 把幾個畫面存成 target/
 ## 已知限制
 
 - 畫面閃退時看不到錯誤訊息；程式自己抓得到的錯誤會寫進書庫旁的 `crash.txt`，下次開啟時顯示
-- 沒有選擇資料夾的畫面，書庫位置是固定的
+- 閱讀進度只存在手機上
 - 介面還是桌面版的排法，按鈕偏小

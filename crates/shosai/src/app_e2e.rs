@@ -624,6 +624,64 @@ fn phone_reads_a_book_by_touch() {
     assert!(p.app.novel.is_none() && p.app.doc.is_none(), "back again returns to the bookshelf");
 }
 
+/// 手機版沒有系統的檔案對話框：書櫃上的「選擇書庫資料夾」打開自己的選擇畫面，
+/// 一層一層點進去，選好之後那個資料夾就是書庫，下次開啟也記得。
+#[test]
+fn phone_picks_its_library_folder() {
+    let mut p = Phone::new("phone-picker");
+    let library = p.dir.clone();
+    assert!(!p.app.settings.library_picked, "the library it starts with was found, not picked");
+    let pick = pos2(PHONE.x * 0.5, 462.0);
+    // 返回鍵關掉選擇畫面，書庫不變
+    p.tap(pick);
+    assert!(p.app.folder_picker.is_some(), "the button on the bookshelf opens the folder picker");
+    p.back();
+    assert!(p.app.folder_picker.is_none(), "back closes it");
+    assert_eq!(p.app.library.as_ref().map(|l| l.root.clone()), Some(library.clone()));
+
+    // 點進第一個資料夾，按「用這個資料夾」
+    p.tap(pick);
+    p.tap(pos2(PHONE.x * 0.5, 267.0));
+    p.tap(pos2(89.0, 181.0));
+    assert!(p.app.folder_picker.is_none(), "choosing closes the picker");
+    let chosen = library.join("星海航路");
+    assert_eq!(p.app.library.as_ref().map(|l| l.root.clone()), Some(chosen.clone()), "the folder is now the library");
+    assert!(p.app.settings.library_picked);
+
+    // 下次啟動（設定存起來再讀回來）：自動找到的書庫不會蓋掉使用者選的
+    let mut saved = MemoryStorage::default();
+    p.app.save(&mut saved);
+    let relaunch = |saved: &MemoryStorage| {
+        let mut cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        cc.storage = Some(saved);
+        let startup = Startup { library: Some(library.clone()), mobile: true, ..Default::default() };
+        ShosaiApp::new(&cc, startup).library.map(|l| l.root)
+    };
+    assert_eq!(relaunch(&saved), Some(chosen.clone()), "the picked library is kept on the next launch");
+    // 沒有存過任何設定（第一次開啟）：用自動找到的
+    assert_eq!(relaunch(&MemoryStorage::default()), Some(library.clone()), "a first launch uses the found library");
+    // 選的資料夾不見了（例如 Nextcloud 那邊刪掉了）：退回自動找到的
+    std::fs::remove_dir_all(&chosen).unwrap();
+    assert_eq!(relaunch(&saved), Some(library.clone()), "a picked library that is gone falls back to the found one");
+}
+
+/// 放在記憶體裡的設定檔（測試「存起來、下次啟動再讀回來」）。
+#[derive(Default)]
+struct MemoryStorage(HashMap<String, String>);
+
+impl eframe::Storage for MemoryStorage {
+    fn get_string(&self, key: &str) -> Option<String> {
+        self.0.get(key).cloned()
+    }
+    fn set_string(&mut self, key: &str, value: String) {
+        self.0.insert(key.to_string(), value);
+    }
+    fn remove_string(&mut self, key: &str) {
+        self.0.remove(key);
+    }
+    fn flush(&mut self) {}
+}
+
 /// 把手機版的幾個畫面存成圖片（`target/shots/mobile-*.png`），用眼睛檢查版面：
 /// `cargo test -p shosai mobile_shots -- --ignored`
 #[test]
@@ -653,4 +711,10 @@ fn mobile_shots() {
     p.app.settings.dark = Some(true);
     p.back();
     p.save("mobile-6-dark.png");
+    p.app.settings.dark = Some(false);
+    p.back();
+    p.save("mobile-7-shelf.png");
+    p.app.actions.push(Action::PickLibrary);
+    p.settle();
+    p.save("mobile-8-picker.png");
 }

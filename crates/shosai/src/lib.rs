@@ -13,6 +13,7 @@ pub mod android;
 mod app;
 mod cli;
 mod find;
+mod folder_picker;
 mod icons;
 mod images;
 mod keys;

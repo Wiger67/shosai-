@@ -13,6 +13,7 @@ use shosai_core::novel::NovelBook;
 use shosai_core::{library, markdown, Book, Entry, EntryKind, Library};
 
 use crate::find::FindState;
+use crate::folder_picker::{FolderPicker, Picked};
 use crate::icons::{self, Icon};
 use crate::md_view::{MdView, ViewEvent, PROBE_BELOW_TOP};
 use crate::novel_view::{toc_row, NovelEvent, NovelPrefs, NovelView, TocRow};
@@ -26,7 +27,7 @@ use crate::tree::{self, DragItem, Place, TreeCtx, TreeNav};
 pub struct Startup {
     /// 命令列指定要開啟的資料夾或檔案
     pub open: Option<PathBuf>,
-    /// 固定使用這個書庫（手機版沒有檔案對話框可以選）
+    /// 使用者還沒自己選過書庫時，用這個（手機版：自動找到的位置）
     pub library: Option<PathBuf>,
     /// 沒有上次的閱讀狀態時，直接用書本模式開這個資料夾
     pub novel: Option<PathBuf>,
@@ -129,6 +130,8 @@ struct Settings {
     novel_pos: HashMap<PathBuf, (PathBuf, usize)>,
     /// 上次關閉時正在用書本模式讀的資料夾
     novel_open: Option<PathBuf>,
+    /// 手機版：書庫是使用者自己選的（否則每次啟動都自動找）
+    library_picked: bool,
 }
 
 impl Default for Settings {
@@ -159,6 +162,7 @@ impl Default for Settings {
             novel: NovelPrefs::default(),
             novel_pos: HashMap::new(),
             novel_open: None,
+            library_picked: false,
         }
     }
 }
@@ -385,6 +389,8 @@ pub struct ShosaiApp {
     content_rect: Option<ContentRect>,
     /// 手機版的介面
     mobile: bool,
+    /// 手機版：正在選書庫資料夾
+    folder_picker: Option<FolderPicker>,
     /// 檔案樹的鍵盤操作
     tree_nav: TreeNav,
     novel_titles: shosai_core::novel::TitleCache,
@@ -514,7 +520,7 @@ impl SettingsTab {
 
 impl ShosaiApp {
     fn new(cc: &eframe::CreationContext<'_>, startup: Startup) -> Self {
-        let Startup { open, library: fixed_library, novel: first_novel, report, content_rect, mobile } = startup;
+        let Startup { open, library: found_library, novel: first_novel, report, content_rect, mobile } = startup;
         crate::trace("window + GL ready");
         egui_extras::install_image_loaders(&cc.egui_ctx);
         theme::install(&cc.egui_ctx);
@@ -562,10 +568,14 @@ impl ShosaiApp {
             window: crate::window::WindowMemory::load(cc.storage),
             content_rect,
             mobile,
+            folder_picker: None,
         };
         app.dialog = report.map(Dialog::Crash);
-        if let Some(root) = fixed_library {
+        // 手機版：使用者自己選過、而且那個資料夾還在，就照舊；否則用自動找到的
+        let picked = app.settings.library_picked && app.settings.library_root.as_ref().is_some_and(|r| r.is_dir());
+        if let (Some(root), false) = (found_library, picked) {
             app.settings.library_root = Some(root);
+            app.settings.library_picked = false;
         }
 
         // 決定開啟的書庫與檔案：命令列參數 > 上次狀態
@@ -1184,6 +1194,10 @@ impl ShosaiApp {
                     self.pdf = None;
                     self.open_library(&p);
                 }
+                Action::PickLibrary if self.mobile => {
+                    let start = FolderPicker::start(self.library.as_ref().map(|l| l.root.as_path()));
+                    self.folder_picker = Some(FolderPicker::open(&start));
+                }
                 Action::PickLibrary => {
                     if let Some(dir) = pick_folder() {
                         self.save_current();
@@ -1227,6 +1241,13 @@ impl ShosaiApp {
         if find_file {
             self.settings.sidebar = true;
             self.focus_filter = true;
+        }
+        // 手機的返回鍵：先關掉蓋在上面的東西（輪不到底下的書本模式處理）
+        if self.mobile && (self.folder_picker.is_some() || self.show_settings || self.settings.sidebar) {
+            let back = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::BrowserBack));
+            if back && self.folder_picker.take().is_none() && !std::mem::take(&mut self.show_settings) {
+                self.settings.sidebar = false;
+            }
         }
         // 文件內尋找、大綱（只在看 Markdown 文件時）
         if self.doc.is_some() && self.novel.is_none() {
@@ -2507,15 +2528,24 @@ impl ShosaiApp {
                     shelf(ui, "（沒有分類的章節）", &root);
                 }
                 ui.add_space(16.0);
-                let hint = if books.is_empty() && !loose { "書庫裡還沒有書。\n" } else { "" };
-                let note = |ui: &mut egui::Ui, text: String| ui.label(RichText::new(text).small().color(pal.weak));
+                let pick = egui::Button::new("選擇書庫資料夾…")
+                    .fill(pal.hover)
+                    .corner_radius(8)
+                    .min_size(egui::vec2(160.0, 40.0));
+                if ui.add(pick).clicked() {
+                    self.actions.push(Action::PickLibrary);
+                }
+                let note = |ui: &mut egui::Ui, text: &str| ui.label(RichText::new(text).small().color(pal.weak));
+                if books.is_empty() && !loose {
+                    note(ui, "這個書庫裡還沒有書。");
+                }
                 note(
                     ui,
-                    format!("{hint}把小說資料夾放進手機的「Shosai」資料夾，\n並在系統設定允許書齋「所有檔案存取權」。"),
+                    "書庫裡的每個資料夾是一本書。\n讀不到手機上的資料夾時，請到系統設定\n允許書齋「所有檔案存取權」。",
                 );
                 ui.add_space(4.0);
-                note(ui, "目前的書庫".to_string());
-                note(ui, root.display().to_string());
+                note(ui, "目前的書庫");
+                note(ui, &root.display().to_string());
             });
         });
     }
@@ -2527,7 +2557,7 @@ impl ShosaiApp {
         }
         let mut open = true;
         let modal = egui::Modal::new(egui::Id::unique("shosai-settings")).show(ctx, |ui| {
-            ui.set_width(640.0);
+            ui.set_width(640.0_f32.min(ctx.content_rect().width() - 32.0));
             ui.horizontal(|ui| {
                 ui.label(RichText::new("設定").size(18.0).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3125,7 +3155,30 @@ impl eframe::App for ShosaiApp {
         }
 
         let surface = egui::Frame::new().fill(pal.surface);
-        if self.novel.is_some() {
+        if self.folder_picker.is_some() {
+            let mut picked = None;
+            egui::CentralPanel::no_frame().show(ui, |ui| {
+                if let Some(picker) = self.folder_picker.as_mut() {
+                    picked = picker.show(ui, &pal);
+                }
+            });
+            match picked {
+                Some(Picked::Chosen(dir)) => {
+                    self.folder_picker = None;
+                    self.close_novel(false);
+                    self.save_current();
+                    self.doc = None;
+                    self.pdf = None;
+                    self.open_library(&dir);
+                    // 開不起來（例如沒有權限）就不算選過，下次啟動照樣自動找
+                    if self.library.as_ref().is_some_and(|l| l.root == dir) {
+                        self.settings.library_picked = true;
+                    }
+                }
+                Some(Picked::Cancelled) => self.folder_picker = None,
+                None => {}
+            }
+        } else if self.novel.is_some() {
             let mut events = Vec::new();
             let prefs = self.settings.novel;
             egui::CentralPanel::no_frame().show(ui, |ui| {
@@ -3470,7 +3523,7 @@ fn pick_folder() -> Option<PathBuf> {
     rfd::FileDialog::new().set_title("選擇書庫資料夾").pick_folder()
 }
 
-/// 手機上書庫的位置是固定的（見 `android.rs`）。
+/// 手機上沒有系統的檔案對話框，改用自己的選擇畫面（`folder_picker.rs`）。
 #[cfg(target_os = "android")]
 fn pick_folder() -> Option<PathBuf> {
     None

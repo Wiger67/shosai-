@@ -1,6 +1,7 @@
 //! Android 版的進入點，以及手機上才需要的啟動流程。
 //!
-//! 手機版只拿來閱讀：沒有檔案對話框，書庫固定在兩個地方之一——
+//! 手機版只拿來閱讀。使用者可以在書櫃上按「選擇書庫資料夾」自己選（`folder_picker.rs`）；
+//! 還沒選過的時候，自動找這兩個地方——
 //!
 //! 1. `/storage/emulated/0/Shosai`（內部儲存空間最上層的 `Shosai` 資料夾）。
 //!    要在系統設定裡允許書齋「所有檔案存取權」才讀得到。
@@ -14,7 +15,7 @@ pub use winit::platform::android::activity::AndroidApp;
 
 use crate::app::Startup;
 
-/// 使用者自己放小說的地方。
+/// 不必選就會自動找到的書庫位置。
 const SHARED_LIBRARY: &str = "/storage/emulated/0/Shosai";
 /// 上次意外結束的原因；下次開啟時顯示出來（手機上看不到標準錯誤輸出）。
 const CRASH_FILE: &str = "crash.txt";
@@ -69,7 +70,7 @@ pub fn main(app: AndroidApp) {
     }
 }
 
-/// 決定書庫的位置。回傳（書庫，第一次開啟時直接用書本模式打開的資料夾）。
+/// 使用者沒有自己選書庫時用哪裡。回傳（書庫，第一次開啟時直接用書本模式打開的資料夾）。
 fn library(external: Option<&Path>) -> (Option<PathBuf>, Option<PathBuf>) {
     let shared = Path::new(SHARED_LIBRARY);
     // 沒有權限時資料夾可能「開得起來但裡面是空的」，所以要真的看到東西才算
