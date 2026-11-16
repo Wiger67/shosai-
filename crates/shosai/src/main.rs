@@ -22,9 +22,19 @@ mod scroll_map;
 mod shot;
 mod theme;
 mod tree;
+mod window;
 
 /// 程式啟動時間（用於 `SHOSAI_STARTUP_TRACE` 量測啟動速度）。
 pub static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// `SHOSAI_STARTUP_TRACE` 開著時，印出啟動到現在經過的時間。
+pub fn trace(what: &str) {
+    if std::env::var_os("SHOSAI_STARTUP_TRACE").is_some() {
+        if let Some(t) = STARTED.get() {
+            eprintln!("{:>8.1} ms  {what}", t.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+}
 
 fn main() {
     STARTED.get_or_init(std::time::Instant::now);

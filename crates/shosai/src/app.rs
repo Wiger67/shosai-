@@ -26,11 +26,14 @@ pub fn run(open: Option<PathBuf>) -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("書齋")
             .with_app_id("shosai")
-            .with_inner_size([1180.0, 760.0])
+            .with_inner_size(crate::window::DEFAULT_SIZE)
             .with_min_inner_size([520.0, 360.0])
             .with_icon(app_icon()),
+        // 設定檔放別的地方（測試用，不動到平常的設定）
+        persistence_path: std::env::var_os("SHOSAI_DATA").map(PathBuf::from),
         ..Default::default()
     };
+    crate::trace("run_native");
     eframe::run_native("shosai", options, Box::new(move |cc| Ok(Box::new(ShosaiApp::new(cc, open)))))
 }
 
@@ -339,6 +342,8 @@ pub struct ShosaiApp {
     watcher: Option<FsWatcher>,
     /// 書本模式
     novel: Option<NovelView>,
+    /// 視窗的位置、大小與是否最大化
+    window: crate::window::WindowMemory,
     /// 檔案樹的鍵盤操作
     tree_nav: TreeNav,
     novel_titles: shosai_core::novel::TitleCache,
@@ -468,8 +473,10 @@ impl SettingsTab {
 
 impl ShosaiApp {
     fn new(cc: &eframe::CreationContext<'_>, open: Option<PathBuf>) -> Self {
+        crate::trace("window + GL ready");
         egui_extras::install_image_loaders(&cc.egui_ctx);
         theme::install(&cc.egui_ctx);
+        crate::trace("theme");
         let settings: Settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
 
         let mut app = ShosaiApp {
@@ -510,6 +517,7 @@ impl ShosaiApp {
             order: CustomOrder::default(),
             watcher: None,
             novel: None,
+            window: crate::window::WindowMemory::load(cc.storage),
         };
 
         // 決定開啟的書庫與檔案：命令列參數 > 上次狀態
@@ -529,12 +537,15 @@ impl ShosaiApp {
             _ => {
                 if let Some(root) = app.settings.library_root.clone().filter(|r| r.is_dir()) {
                     app.open_library(&root);
+                    crate::trace("open_library");
                     if let Some(last) = app.settings.last_file.clone().filter(|f| f.is_file()) {
                         app.open_file(&last);
+                        crate::trace("open_file");
                     }
                     if let Some(novel) = app.settings.novel_open.clone().filter(|d| d.is_dir() && d.starts_with(&root))
                     {
                         app.open_novel(&novel, None);
+                        crate::trace("open_novel");
                     }
                 }
             }
@@ -552,12 +563,16 @@ impl ShosaiApp {
                 self.settings.recent_libraries.retain(|r| r != root);
                 self.settings.recent_libraries.insert(0, root.to_path_buf());
                 self.settings.recent_libraries.truncate(8);
+                crate::trace("  Library::open");
                 self.order = CustomOrder::load(root);
                 self.library = Some(lib);
                 self.novel = None;
                 self.watcher = FsWatcher::start(root, &self.ctx);
+                crate::trace("  watcher");
                 self.resort();
+                crate::trace("  resort");
                 self.reload_books();
+                crate::trace("  reload_books");
             }
             Err(e) => self.error(format!("無法開啟資料夾：{e}")),
         }
@@ -2928,6 +2943,10 @@ impl ShosaiApp {
 impl eframe::App for ShosaiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if self.first_frame {
+            crate::trace("first ui() start");
+        }
+        self.window.track(&ctx);
         self.sync.wheel = ctx.input(|i| i.smooth_scroll_delta != egui::Vec2::ZERO);
         self.apply_theme(&ctx);
         self.shortcuts(&ctx);
@@ -3119,6 +3138,8 @@ impl eframe::App for ShosaiApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, &self.settings);
+        // eframe 剛寫過視窗狀態，但縮到工作列時它會記錯，換成自己記的
+        self.window.save(storage);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

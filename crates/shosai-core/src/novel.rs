@@ -51,7 +51,10 @@ impl NovelBook {
         let mut chapters = Vec::new();
         match book {
             Some(b) => chapters_of_book(b, None, &mut chapters),
-            None => collect(children, None, titles, &mut chapters),
+            None => {
+                prefetch_titles(children, titles);
+                collect(children, None, titles, &mut chapters);
+            }
         }
         let folder = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         NovelBook {
@@ -78,6 +81,30 @@ fn chapters_of_book(book: &Book, volume: Option<&str>, out: &mut Vec<NovelChapte
             (None, s) => s,
         };
         out.push(NovelChapter { path: ch.path.clone(), title: ch.title.clone(), volume });
+    }
+}
+
+/// 先把快取裡沒有（或檔案改過）的章名一次找齊：分給幾個執行緒同時讀，比逐章讀快得多。
+fn prefetch_titles(entries: &[Entry], titles: &mut TitleCache) {
+    fn stale<'a>(entries: &'a [Entry], titles: &TitleCache, out: &mut Vec<&'a Entry>) {
+        for e in entries {
+            match e.kind {
+                EntryKind::Markdown => {
+                    let fresh = titles.get(&e.path).is_some_and(|(s, _)| e.modified.is_some() && *s == e.modified);
+                    if !fresh {
+                        out.push(e);
+                    }
+                }
+                EntryKind::Dir => stale(&e.children, titles, out),
+                _ => {}
+            }
+        }
+    }
+    let mut todo = Vec::new();
+    stale(entries, titles, &mut todo);
+    let paths: Vec<&Path> = todo.iter().map(|e| e.path.as_path()).collect();
+    for (e, title) in todo.iter().zip(crate::book::chapter_titles(&paths)) {
+        titles.insert(e.path.clone(), (e.modified, title));
     }
 }
 

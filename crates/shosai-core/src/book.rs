@@ -185,10 +185,14 @@ impl Book {
             .iter()
             .map(|rel| {
                 let path = self.root.join(rel);
-                let title = chapter_title(&path);
-                Chapter { rel: rel.clone(), path, title }
+                Chapter { rel: rel.clone(), path, title: String::new() }
             })
             .collect();
+        let paths: Vec<&Path> = self.chapters.iter().map(|c| c.path.as_path()).collect();
+        let titles = chapter_titles(&paths);
+        for (ch, title) in self.chapters.iter_mut().zip(titles) {
+            ch.title = title;
+        }
         Ok(())
     }
 
@@ -248,8 +252,63 @@ impl Book {
     }
 }
 
-/// 章節標題：第一個一級標題，否則為去掉編號前綴的檔名。
+/// 章節標題：第一個一級標題，沒有的話是 front matter 的 title，再沒有就是去掉編號前綴的檔名。
+///
+/// 章名幾乎都在檔案最前面，所以先只讀開頭一小段來找；那一段裡沒有一級標題才讀整個檔案。
+/// 一本書幾百章，開書、檔案樹更新時都要逐章找一次，整個讀進來再完整解析會慢上好幾倍。
 pub fn chapter_title(path: &Path) -> String {
+    head_title(path).unwrap_or_else(|| title_from_filename(path))
+}
+
+/// 一次找很多章的章名：分給幾個執行緒同時讀（磁碟與防毒軟體的延遲可以重疊）。
+pub fn chapter_titles(paths: &[&Path]) -> Vec<String> {
+    const PER_THREAD: usize = 32;
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+    if paths.len() <= PER_THREAD || threads < 2 {
+        return paths.iter().map(|p| chapter_title(p)).collect();
+    }
+    let chunk = paths.len().div_ceil(threads).max(PER_THREAD);
+    std::thread::scope(|s| {
+        let jobs: Vec<_> = paths
+            .chunks(chunk)
+            .map(|part| s.spawn(move || part.iter().map(|p| chapter_title(p)).collect::<Vec<_>>()))
+            .collect();
+        // 某個執行緒出錯就讓它照原樣崩潰：少了一段的話，後面每一章都會對到別章的章名
+        jobs.into_iter().flat_map(|j| j.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).collect()
+    })
+}
+
+/// 先讀這麼多位元組找章名。
+const TITLE_HEAD: usize = 4096;
+
+fn head_title(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+    let mut file = fs::File::open(path).ok()?;
+    let mut buf = Vec::with_capacity(TITLE_HEAD);
+    file.by_ref().take(TITLE_HEAD as u64).read_to_end(&mut buf).ok()?;
+    if buf.len() == TITLE_HEAD {
+        // 只看到最後一個空行為止：之前的段落、標題都是完整的，解析結果和讀整個檔案時一樣
+        if let Some(head) = last_blank_line(&buf).and_then(|end| std::str::from_utf8(&buf[..end]).ok()) {
+            if let Some(h) = crate::hmd::parse(head).headings().into_iter().find(|h| h.level == 1) {
+                return Some(h.text).filter(|t| !t.is_empty());
+            }
+        }
+        // 開頭沒有一級標題（或沒有空行）：讀整個檔案
+        file.read_to_end(&mut buf).ok()?;
+    }
+    markdown::title(&String::from_utf8(buf).ok()?)
+}
+
+/// 最後一個空行（只有換行，或 `\r\n`）結束的位置。
+fn last_blank_line(buf: &[u8]) -> Option<usize> {
+    (1..buf.len())
+        .rev()
+        .find(|&i| buf[i] == b'\n' && (buf[i - 1] == b'\n' || (buf[i - 1] == b'\r' && i >= 2 && buf[i - 2] == b'\n')))
+}
+
+/// 舊的做法（讀整個檔案、完整解析），用來核對 [`chapter_title`] 的結果一致。
+#[cfg(test)]
+fn chapter_title_full(path: &Path) -> String {
     if let Ok(text) = fs::read_to_string(path) {
         if let Some(t) = markdown::title(&text) {
             return t;
@@ -296,6 +355,80 @@ fn collect_markdown(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn titles_from_the_head_match_full_parsing() {
+        let d = tmp("titles");
+        fs::create_dir_all(&d).unwrap();
+        let body = "內文。".repeat(600) + "\n\n";
+        let cases = [
+            ("plain.md", "# 第一章　出發\n\n".to_string() + &body.repeat(4)),
+            ("crlf.md", "# 第二章\r\n\r\n".to_string() + &body.replace('\n', "\r\n").repeat(4)),
+            ("front.md", "---\ntitle: 前言\n---\n\n".to_string() + &body.repeat(4)),
+            ("late.md", body.repeat(3) + "# 很後面才出現的標題\n\n" + &body),
+            ("h2-first.md", "## 小標\n\n".to_string() + &body.repeat(3) + "# 真正的章名\n"),
+            ("setext.md", "設定式標題\n=====\n\n".to_string() + &body.repeat(4)),
+            ("empty-h1.md", "#\n\n".to_string() + &body.repeat(4)),
+            ("short.md", "# 短\n".to_string()),
+            ("no-blank.md", "一".repeat(3000) + "\n# 標題\n"),
+            ("03-沒有標題.md", body.repeat(4)),
+        ];
+        let mut paths = Vec::new();
+        for (name, text) in &cases {
+            fs::write(d.join(name), text).unwrap();
+            paths.push(d.join(name));
+        }
+        fs::write(d.join("latin1.md"), b"# caf\xe9\n\n".repeat(800)).unwrap();
+        paths.push(d.join("latin1.md"));
+        for p in &paths {
+            assert_eq!(chapter_title(p), chapter_title_full(p), "{}", p.display());
+        }
+        assert_eq!(chapter_title(&d.join("late.md")), "很後面才出現的標題");
+        assert_eq!(chapter_title(&d.join("03-沒有標題.md")), "沒有標題");
+        // 很多章一起找（多執行緒）：順序不變
+        let many: Vec<&Path> = paths.iter().cycle().take(200).map(PathBuf::as_path).collect();
+        let expected: Vec<String> = many.iter().map(|p| chapter_title_full(p)).collect();
+        assert_eq!(chapter_titles(&many), expected);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// 在真實的書庫上核對：`SHOSAI_TITLE_DIR=資料夾 cargo test -p shosai-core real_titles -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a real library folder"]
+    fn real_titles_match_full_parsing() {
+        let Some(root) = std::env::var_os("SHOSAI_TITLE_DIR") else { return };
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for e in fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if is_markdown(&p) {
+                    out.push(p);
+                }
+            }
+        }
+        let mut paths = Vec::new();
+        walk(Path::new(&root), &mut paths);
+        let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+        let t = std::time::Instant::now();
+        let full: Vec<String> = refs.iter().map(|p| chapter_title_full(p)).collect();
+        let t_full = t.elapsed();
+        let t = std::time::Instant::now();
+        let serial: Vec<String> = refs.iter().map(|p| chapter_title(p)).collect();
+        let t_head = t.elapsed();
+        let t = std::time::Instant::now();
+        let parallel = chapter_titles(&refs);
+        let t_par = t.elapsed();
+        let mut diff = 0;
+        for ((p, a), (b, c)) in refs.iter().zip(&full).zip(serial.iter().zip(&parallel)) {
+            if a != b || a != c {
+                diff += 1;
+                println!("{}: full {a:?} / head {b:?} / parallel {c:?}", p.display());
+            }
+        }
+        println!("{} files: full {t_full:?}, head {t_head:?}, head + threads {t_par:?}", paths.len());
+        assert_eq!(diff, 0);
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("shosai-test-{name}-{}", std::process::id()));
