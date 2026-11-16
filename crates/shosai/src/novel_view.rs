@@ -78,11 +78,11 @@ const HEAD: u8 = 8;
 /// 觸控板（以點數回報的捲動）滑多少點翻一頁
 const WHEEL_POINTS_PER_PAGE: f32 = 120.0;
 /// 翻頁動畫的長度（秒）
-const TURN_SECS: f64 = 0.45;
+const TURN_SECS: f64 = 0.7;
 /// 連續快翻時用的短動畫（秒）
-const TURN_FAST_SECS: f64 = 0.14;
+const TURN_FAST_SECS: f64 = 0.26;
 /// 距離上一次翻頁不到這麼久又翻（秒），就算是連續快翻
-const TURN_RAPID_SECS: f64 = 0.55;
+const TURN_RAPID_SECS: f64 = 0.85;
 /// 兩次翻頁近到這個程度（秒）連短動畫都來不及看：直接換頁
 const TURN_SNAP_SECS: f64 = 0.06;
 
@@ -2316,7 +2316,7 @@ one two three four five six
         assert_eq!(s.v.turn.as_ref().unwrap().from.page, 2, "starts from the page the last turn was heading to");
         // 繼續連轉：每一格都是短動畫，而且在下一格來之前就播完了
         for page in [6, 8, 10] {
-            s.frame(0.15, Vec::new());
+            s.frame(0.3, Vec::new());
             assert!(s.v.turn.is_none(), "the short animation is over before the next notch");
             s.wheel(1.0);
             assert_eq!(s.at(), (Unit::Chapter(0), page));
