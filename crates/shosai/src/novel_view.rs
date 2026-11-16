@@ -254,6 +254,8 @@ pub struct NovelView {
     end_flash: Option<std::time::Instant>,
     /// 手指（或滑鼠）按著拖了多遠；放開時用來判斷是不是滑動翻頁
     swipe: egui::Vec2,
+    /// 手指按下去的位置：抖了一下、沒滑夠遠就放開，當成點在這裡
+    swipe_from: Option<egui::Pos2>,
 }
 
 impl NovelView {
@@ -287,6 +289,7 @@ impl NovelView {
             wheel_at: 0.0,
             end_flash: None,
             swipe: egui::Vec2::ZERO,
+            swipe_from: None,
         }
     }
 
@@ -811,8 +814,29 @@ impl NovelView {
             ui.painter().rect_filled(r.expand(2.0), 4.0, pal.hover);
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
+        // 手機：左右滑動翻頁。像撥紙一樣，往哪邊滑，紙就往哪邊走
+        // （橫排的下一頁在右邊，要往左撥；直排相反）
+        if resp.drag_started() {
+            self.swipe_from = ui.input(|i| i.pointer.press_origin());
+        }
+        if let Some(d) = resp.total_drag_delta() {
+            self.swipe = d;
+        }
+        let mut swiped = None;
         // 點在哪裡要另外問：手指放開的那一幀已經沒有「游標位置」了
-        let clicked_link = if resp.clicked() { link_at(resp.interact_pointer_pos()).map(|(_, i)| *i) } else { None };
+        let mut tapped = if resp.clicked() { resp.interact_pointer_pos() } else { None };
+        if resp.drag_stopped() {
+            let d = std::mem::take(&mut self.swipe);
+            let from = self.swipe_from.take();
+            if swipe_turns(d) {
+                swiped = Some((d.x < 0.0) != prefs.vertical);
+            } else if d.length() < TAP_SLOP {
+                // 手指點下去時微微移動，系統就當成「拖曳」而不是「點一下」：
+                // 沒滑多遠就照點一下處理，否則常常要點兩三次才翻得過去
+                tapped = from;
+            }
+        }
+        let clicked_link = link_at(tapped).map(|(_, i)| *i);
 
         // 進度條
         let bar_y = area.bottom() - 7.0;
@@ -840,46 +864,39 @@ impl NovelView {
 
         if let Some(ch) = clicked_link {
             self.go(Unit::Chapter(ch), Want::First);
-        } else if resp.clicked() {
-            // 點頁面左右兩側翻頁，中間開關目錄
-            if let Some(p) = resp.interact_pointer_pos() {
-                let t = (p.x - area.left()) / area.width();
-                let forward_on_right = !prefs.vertical;
-                if t < 0.35 {
-                    if forward_on_right {
-                        self.prev_page(spread)
-                    } else {
-                        self.next_page(spread)
-                    }
-                } else if t > 0.65 {
-                    if forward_on_right {
-                        self.next_page(spread)
-                    } else {
-                        self.prev_page(spread)
-                    }
-                } else {
-                    self.show_toc = !self.show_toc;
-                }
-            }
-        }
-        // 手機：左右滑動翻頁。像撥紙一樣，往哪邊滑，紙就往哪邊走
-        // （橫排的下一頁在右邊，要往左撥；直排相反）
-        if let Some(d) = resp.total_drag_delta() {
-            self.swipe = d;
-        }
-        if resp.drag_stopped() {
-            let d = std::mem::take(&mut self.swipe);
-            if swipe_turns(d) {
-                if (d.x < 0.0) != prefs.vertical {
-                    self.next_page(spread)
-                } else {
-                    self.prev_page(spread)
-                }
+        } else if let Some(p) = tapped {
+            self.tap(p, area, prefs, spread);
+        } else if let Some(forward) = swiped {
+            if forward {
+                self.next_page(spread)
+            } else {
+                self.prev_page(spread)
             }
         }
         if self.turn.is_some() {
             // 只有動畫播放中才連續重畫；播完就停
             ui.ctx().request_repaint();
+        }
+    }
+
+    /// 點在頁面 `p`：左右兩側翻頁，中間開關目錄。
+    fn tap(&mut self, p: egui::Pos2, area: Rect, prefs: &NovelPrefs, spread: bool) {
+        let t = (p.x - area.left()) / area.width();
+        let forward_on_right = !prefs.vertical;
+        if t < 0.35 {
+            if forward_on_right {
+                self.prev_page(spread)
+            } else {
+                self.next_page(spread)
+            }
+        } else if t > 0.65 {
+            if forward_on_right {
+                self.next_page(spread)
+            } else {
+                self.prev_page(spread)
+            }
+        } else {
+            self.show_toc = !self.show_toc;
         }
     }
 
@@ -1797,13 +1814,16 @@ fn paint_image(d: &Draw, inner: Rect, path: &Path, alt: &str, cache: &ImageCache
         }
         Some(Err(e)) => {
             let label = if alt.is_empty() { "插圖" } else { alt };
-            p.text(
-                inner.center(),
-                Align2::CENTER_CENTER,
+            // 手機的頁面很窄，路徑一長就超出紙張：自動換行、置中
+            let mut job = egui::text::LayoutJob::simple(
                 format!("［{label}］\n{e}"),
                 FontId::proportional(13.0),
                 pal.weak,
+                inner.width(),
             );
+            job.halign = egui::Align::Center;
+            let galley = p.layout_job(job);
+            p.galley(pos2(inner.center().x, inner.center().y - galley.size().y / 2.0), galley, pal.weak);
         }
         None => {
             p.text(inner.center(), Align2::CENTER_CENTER, "載入插圖中…", FontId::proportional(13.0), pal.weak);
@@ -2020,8 +2040,14 @@ fn rotated(p: &egui::Painter, text: &str, center: egui::Pos2, size: f32, color: 
 
 /// 按著拖了 `d` 之後放開，算不算「左右滑動翻頁」：要夠長，而且明顯是橫的。
 fn swipe_turns(d: egui::Vec2) -> bool {
-    d.x.abs() >= 36.0 && d.x.abs() >= 1.5 * d.y.abs()
+    d.x.abs() >= SWIPE_MIN && d.x.abs() >= 1.5 * d.y.abs()
 }
+
+/// 滑動翻頁至少要橫移這麼遠（點）。
+const SWIPE_MIN: f32 = 36.0;
+/// 手指按下去到放開只移動這麼遠（點），當成點一下（egui 自己只容許 6 點，手指點螢幕常常超過）。
+/// 介於這個和 [`SWIPE_MIN`] 之間的拖曳什麼都不做：看不出是想點還是想滑。
+const TAP_SLOP: f32 = 16.0;
 
 /// 把這一幀的滾輪量加進累積量 `acc`（單位：頁），回傳現在要翻幾頁（負值往後翻，正值往回翻）。
 ///
@@ -2391,6 +2417,28 @@ one two three four five six
         s.drag(mid, mid + vec2(-120.0, 0.0));
         s.settle();
         assert_eq!(s.at(), (before.0, before.1 + 2), "swiping left goes forward in a horizontal book");
+    }
+
+    /// 手指點螢幕時多半會微微移動：egui 當成拖曳，但還是要照點一下翻頁、開目錄。
+    #[test]
+    fn a_jittery_tap_still_turns_the_page() {
+        let mut s = Stage::new("jitter");
+        s.v.compact = true;
+        s.settle();
+        let (w, h) = (STAGE.x, STAGE.y);
+        // 直排：點左側是下一頁。手指往下滑了 10 點才放開
+        let left = pos2(w * 0.15, h / 2.0);
+        s.drag(left, left + vec2(3.0, 10.0));
+        s.settle();
+        assert_eq!(s.at(), (Unit::Chapter(0), 2), "a tap that wobbled a little still turns the page");
+        let right = pos2(w * 0.85, h / 2.0);
+        s.drag(right, right + vec2(-6.0, 8.0));
+        s.settle();
+        assert_eq!(s.at(), (Unit::Chapter(0), 0), "and back");
+        let mid = STAGE.to_pos2() / 2.0;
+        s.drag(mid, mid + vec2(5.0, -5.0));
+        s.settle();
+        assert!(s.v.show_toc, "a wobbly tap in the middle opens the contents");
     }
 
     #[test]

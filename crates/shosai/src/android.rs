@@ -11,9 +11,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use eframe::egui;
+use jni::objects::JObject;
+use jni::{jni_sig, jni_str, Env, JavaVM};
 pub use winit::platform::android::activity::AndroidApp;
 
-use crate::app::Startup;
+use crate::app::{Device, Startup};
 
 /// 不必選就會自動找到的書庫位置。
 const SHARED_LIBRARY: &str = "/storage/emulated/0/Shosai";
@@ -54,19 +57,73 @@ pub fn main(app: AndroidApp) {
     }
 
     let (library, novel) = library(external.as_deref());
-    // 系統列以外、真正可以畫東西的範圍（視窗本身蓋滿整個螢幕）
-    let rect_app = app.clone();
-    let content_rect = move || {
-        let r = rect_app.content_rect();
-        [r.left as f32, r.top as f32, r.right as f32, r.bottom as f32]
-    };
-    let startup =
-        Startup { open: None, library, novel, report, content_rect: Some(Box::new(content_rect)), mobile: true };
+    // SAFETY: android-activity 給的是這個行程裡有效的 JavaVM 指標
+    let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) };
+    let device: Box<dyn Device> = Box::new(Android { app: app.clone(), vm });
+    let startup = Startup { open: None, library, novel, report, device: Some(device), mobile: true };
     let storage = internal.map(|d| d.join("settings.ron"));
     if let Err(e) = crate::app::run_android(app, startup, storage) {
         if let Some(path) = crash {
             let _ = fs::write(path, format!("無法啟動畫面：{e}\n"));
         }
+    }
+}
+
+/// 透過 JNI 使用 `ShosaiActivity`（`crates/shosai-android/java`）提供的功能。
+///
+/// APK 沒有包進那個 Java 類別時（例如直接用 `cargo apk build` 打包），
+/// 呼叫會失敗：這時退回 NativeActivity 本身回報的內容範圍，權限則當成已經有了。
+struct Android {
+    app: AndroidApp,
+    vm: JavaVM,
+}
+
+impl Android {
+    fn with_activity<T>(&self, f: impl FnOnce(&mut Env, &JObject) -> jni::errors::Result<T>) -> Option<T> {
+        self.vm
+            .attach_current_thread(|env| {
+                // SAFETY: activity_as_ptr 是 Activity 的全域參照，在 App 結束前都有效；
+                // JObject 不會在 drop 時刪掉參照
+                let activity = unsafe { JObject::from_raw(env, self.app.activity_as_ptr().cast()) };
+                f(env, &activity)
+            })
+            .ok()
+    }
+}
+
+impl Device for Android {
+    fn safe_insets(&self, screen: egui::Vec2) -> [f32; 4] {
+        let insets = self.with_activity(|env, activity| {
+            let mut field = |name| env.get_field(activity, name, jni_sig!(jint))?.i();
+            Ok([
+                field(jni_str!("safeLeft"))?,
+                field(jni_str!("safeTop"))?,
+                field(jni_str!("safeRight"))?,
+                field(jni_str!("safeBottom"))?,
+            ])
+        });
+        if let Some(insets) = insets {
+            return insets.map(|v| v as f32);
+        }
+        let r = self.app.content_rect();
+        if r.right <= r.left || r.bottom <= r.top {
+            return [0.0; 4]; // 系統還沒回報
+        }
+        [r.left as f32, r.top as f32, screen.x - r.right as f32, screen.y - r.bottom as f32]
+    }
+
+    fn has_all_files_access(&self) -> bool {
+        self.with_activity(|env, activity| {
+            env.call_method(activity, jni_str!("hasAllFilesAccess"), jni_sig!(() -> jboolean), &[])?.z()
+        })
+        .unwrap_or(true)
+    }
+
+    fn request_all_files_access(&self) {
+        let _ = self.with_activity(|env, activity| {
+            env.call_method(activity, jni_str!("requestAllFilesAccess"), jni_sig!(() -> void), &[])?;
+            Ok(())
+        });
     }
 }
 

@@ -33,14 +33,26 @@ pub struct Startup {
     pub novel: Option<PathBuf>,
     /// 一開啟就顯示的訊息（手機版：上次意外結束的原因）
     pub report: Option<String>,
-    /// 系統列以外可以畫東西的範圍（左、上、右、下，實體像素）。
-    /// 手機上視窗蓋滿整個螢幕，要自己避開導覽列。
-    pub content_rect: Option<ContentRect>,
+    /// 手機上才有的功能：畫面邊緣、檔案存取權限
+    pub device: Option<Box<dyn Device>>,
     /// 手機版的介面：首頁是書櫃、工具列精簡、結束書本模式就回書櫃
     pub mobile: bool,
 }
 
-pub type ContentRect = Box<dyn Fn() -> [f32; 4]>;
+/// 手機上才有的功能（由 `android.rs` 實作；測試裡用假的）。
+pub trait Device {
+    /// 畫面四邊不能放按鈕的寬度（左、上、右、下，實體像素）：前鏡頭挖孔、沒藏起來的系統列。
+    /// `screen` 是整個畫面的大小（實體像素）。
+    fn safe_insets(&self, screen: egui::Vec2) -> [f32; 4];
+    /// 能不能讀其他 App（例如 Nextcloud）放在手機裡的檔案（Android 的「所有檔案存取權」）。
+    /// 沒有的話只看得到資料夾名稱，看不到裡面的文章。
+    fn has_all_files_access(&self) -> bool;
+    /// 打開系統設定裡允許「所有檔案存取權」的頁面。
+    fn request_all_files_access(&self);
+}
+
+/// 多久再問一次系統：使用者是不是已經允許「所有檔案存取權」了。
+const ACCESS_RECHECK: Duration = Duration::from_secs(1);
 
 /// 在手機上執行：畫面窄、用手指操作、只拿來閱讀（決定設定的預設值）。
 const MOBILE: bool = cfg!(target_os = "android");
@@ -385,8 +397,10 @@ pub struct ShosaiApp {
     novel: Option<NovelView>,
     /// 視窗的位置、大小與是否最大化
     window: crate::window::WindowMemory,
-    /// 手機版：系統列以外可以畫東西的範圍
-    content_rect: Option<ContentRect>,
+    /// 手機上才有的功能
+    device: Option<Box<dyn Device>>,
+    /// 手機版：上次問到的「所有檔案存取權」，以及什麼時候問的
+    files_access: Option<(bool, Instant)>,
     /// 手機版的介面
     mobile: bool,
     /// 手機版：正在選書庫資料夾
@@ -520,7 +534,7 @@ impl SettingsTab {
 
 impl ShosaiApp {
     fn new(cc: &eframe::CreationContext<'_>, startup: Startup) -> Self {
-        let Startup { open, library: found_library, novel: first_novel, report, content_rect, mobile } = startup;
+        let Startup { open, library: found_library, novel: first_novel, report, device, mobile } = startup;
         crate::trace("window + GL ready");
         egui_extras::install_image_loaders(&cc.egui_ctx);
         theme::install(&cc.egui_ctx);
@@ -566,7 +580,8 @@ impl ShosaiApp {
             watcher: None,
             novel: None,
             window: crate::window::WindowMemory::load(cc.storage),
-            content_rect,
+            device,
+            files_access: None,
             mobile,
             folder_picker: None,
         };
@@ -686,7 +701,11 @@ impl ShosaiApp {
             return;
         };
         if book.chapters.is_empty() {
-            self.info("這個資料夾裡沒有 Markdown 檔");
+            if self.files_access.is_some_and(|(ok, _)| !ok) {
+                self.error("沒有「所有檔案存取權」，讀不到這本書裡的文章");
+            } else {
+                self.info("這個資料夾裡沒有 Markdown 檔");
+            }
             return;
         }
         self.save_current();
@@ -2500,6 +2519,7 @@ impl ShosaiApp {
 
     /// 手機版的首頁：書庫最上層的每個資料夾是一本書，點一下就用書本模式打開。
     fn bookshelf(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        self.files_access_banner(ui, pal);
         let Some(lib) = &self.library else { return };
         let books: Vec<(PathBuf, String)> = lib
             .entries
@@ -2539,15 +2559,63 @@ impl ShosaiApp {
                 if books.is_empty() && !loose {
                     note(ui, "這個書庫裡還沒有書。");
                 }
-                note(
-                    ui,
-                    "書庫裡的每個資料夾是一本書。\n讀不到手機上的資料夾時，請到系統設定\n允許書齋「所有檔案存取權」。",
-                );
+                note(ui, "書庫裡的每個資料夾是一本書。");
                 ui.add_space(4.0);
                 note(ui, "目前的書庫");
                 note(ui, &root.display().to_string());
             });
         });
+    }
+
+    /// 手機版：問系統是不是允許了「所有檔案存取權」。還沒允許時每秒再問一次，
+    /// 使用者從設定頁回來、剛允許的那一刻就重新讀一次書庫（之前只看得到資料夾名稱）。
+    fn check_files_access(&mut self) {
+        let Some(device) = &self.device else { return };
+        let due = self.files_access.is_none_or(|(ok, at)| !ok && at.elapsed() >= ACCESS_RECHECK);
+        if !due {
+            return;
+        }
+        let ok = device.has_all_files_access();
+        let granted_now = ok && self.files_access.is_some_and(|(was, _)| !was);
+        self.files_access = Some((ok, Instant::now()));
+        if granted_now {
+            self.refresh();
+            self.info("已經可以讀取手機上的檔案了");
+        }
+        if !ok {
+            self.ctx.request_repaint_after(ACCESS_RECHECK);
+        }
+    }
+
+    /// 手機版：還沒有「所有檔案存取權」時，在書櫃與選資料夾的畫面上方說明，並提供前往設定的按鈕。
+    fn files_access_banner(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        if !self.files_access.is_some_and(|(ok, _)| !ok) {
+            return;
+        }
+        let mut open_settings = false;
+        egui::Frame::new().fill(pal.selected).corner_radius(10).inner_margin(12).outer_margin(10).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 8.0;
+            ui.label(RichText::new("書齋還沒有「所有檔案存取權」").strong().color(pal.ink));
+            ui.label(
+                RichText::new(
+                    "所以讀不到 Nextcloud 或其他 App 放在手機裡的小說，只看得到資料夾名稱。\n\
+                     按下面的按鈕，在設定頁打開「允許管理所有檔案」後回到書齋。",
+                )
+                .small()
+                .color(pal.ink),
+            );
+            let button = egui::Button::new(RichText::new("前往設定允許").color(Color32::WHITE))
+                .fill(pal.accent)
+                .corner_radius(8)
+                .min_size(egui::vec2(140.0, 40.0));
+            open_settings = ui.add(button).clicked();
+        });
+        if open_settings {
+            if let Some(device) = &self.device {
+                device.request_all_files_access();
+            }
+        }
     }
 
     /// 設定視窗（左上角齒輪 / Ctrl+,）。調整會立即套用並自動保存。
@@ -3075,6 +3143,7 @@ impl eframe::App for ShosaiApp {
         if !self.mobile {
             self.window.track(&ctx);
         }
+        self.check_files_access();
         self.sync.wheel = ctx.input(|i| i.smooth_scroll_delta != egui::Vec2::ZERO);
         self.apply_theme(&ctx);
         self.shortcuts(&ctx);
@@ -3157,7 +3226,8 @@ impl eframe::App for ShosaiApp {
         let surface = egui::Frame::new().fill(pal.surface);
         if self.folder_picker.is_some() {
             let mut picked = None;
-            egui::CentralPanel::no_frame().show(ui, |ui| {
+            egui::CentralPanel::no_frame().frame(surface).show(ui, |ui| {
+                self.files_access_banner(ui, &pal);
                 if let Some(picker) = self.folder_picker.as_mut() {
                     picked = picker.show(ui, &pal);
                 }
@@ -3308,20 +3378,17 @@ impl eframe::App for ShosaiApp {
 
     /// 手機版：把系統導覽列佔掉的邊緣告訴 egui，面板就不會排到它底下。
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
-        let (Some(content_rect), Some(screen)) = (&self.content_rect, raw.screen_rect) else { return };
-        let [left, top, right, bottom] = content_rect();
-        if right <= left || bottom <= top {
-            return; // 系統還沒回報
-        }
+        let (Some(device), Some(screen)) = (&self.device, raw.screen_rect) else { return };
         let ppp = ctx.pixels_per_point();
+        let [left, top, right, bottom] = device.safe_insets(screen.size() * ppp);
         // 回報的數字不合理（超過畫面的五分之一）就不理它，免得整個畫面被擠掉
         let inset = |px: f32, full: f32| (px / ppp).clamp(0.0, full * 0.2);
         let (w, h) = (screen.width(), screen.height());
         raw.safe_area_insets = Some(egui::SafeAreaInsets(egui::epaint::MarginF32 {
             left: inset(left, w),
             top: inset(top, h),
-            right: inset(w * ppp - right, w),
-            bottom: inset(h * ppp - bottom, h),
+            right: inset(right, w),
+            bottom: inset(bottom, h),
         }));
     }
 

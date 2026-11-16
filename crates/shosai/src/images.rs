@@ -58,6 +58,9 @@ pub fn get(
 }
 
 fn load(path: &Path, ctx: &egui::Context) -> ImageState {
+    if !path.is_file() {
+        return ImageState::Failed(missing_message(path));
+    }
     let img = match image::open(path) {
         Ok(i) => i,
         Err(e) => return ImageState::Failed(format!("無法讀取圖片：{e}")),
@@ -70,4 +73,36 @@ fn load(path: &Path, ctx: &egui::Context) -> ImageState {
         egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw());
     let tex = ctx.load_texture(path.display().to_string(), color, egui::TextureOptions::LINEAR);
     ImageState::Ready(tex, [w, h])
+}
+
+/// 圖片檔不存在時的說明：列出最後幾層路徑，看得出是哪個資料夾少了檔案。
+/// 最常見的原因是同步程式（例如手機上的 Nextcloud App）還沒把那個資料夾下載下來。
+fn missing_message(path: &Path) -> String {
+    // 先把 `章節/../插圖/x.jpg` 這種寫法化簡，顯示的才是實際要找的位置
+    let mut parts: Vec<String> = Vec::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            std::path::Component::Normal(s) => parts.push(s.to_string_lossy().into_owned()),
+            _ => {}
+        }
+    }
+    let tail = parts[parts.len().saturating_sub(3)..].join("/");
+    format!("找不到圖片檔：{tail}\n同步的資料夾可能還沒下載完")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_image_says_which_file() {
+        let dir = Path::new("/storage/emulated/0/書/86/01 第一卷");
+        let path = resolve(dir, "../插圖/01%20第一卷/001.jpg");
+        let ImageState::Failed(msg) = load(&path, &egui::Context::default()) else { panic!("loaded a missing file") };
+        assert!(msg.contains("插圖/01 第一卷/001.jpg"), "{msg}");
+        assert!(!msg.contains(".."), "{msg}");
+    }
 }

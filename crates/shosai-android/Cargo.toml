@@ -22,12 +22,18 @@ resources = "res"
 min_sdk_version = 26
 target_sdk_version = 34
 
-# 讀取內部儲存空間的 Shosai 資料夾（要在系統設定裡手動允許「所有檔案存取權」）
+# 讀取 Nextcloud 等其他 App 放在手機裡的檔案（要在系統設定裡允許「所有檔案存取權」，
+# 書齋裡有按鈕直接打開那個設定頁）
 [[package.metadata.android.uses_permission]]
 name = "android.permission.MANAGE_EXTERNAL_STORAGE"
 
 [package.metadata.android.application]
 label = "書齋"
 icon = "@mipmap/ic_launcher"
-# 全螢幕：隱藏狀態列，畫面不會跑到前鏡頭底下
 theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+# 入口是 java/ 裡的 ShosaiActivity（NativeActivity 再加上全螢幕與權限）。
+# cargo apk 不會編 Java，要用 build.ps1 打包，否則一開啟就會因為找不到這個類別而結束
+has_code = true
+
+[package.metadata.android.application.activity]
+name = "app.shosai.ShosaiActivity"

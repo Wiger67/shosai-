@@ -441,10 +441,39 @@ const PHONE_PPP: f32 = 2.0;
 /// 系統導覽列佔掉最下面的這麼多點。
 const PHONE_NAV_BAR: f32 = 24.0;
 
+/// 測試用的手機：導覽列佔掉最下面一條，「所有檔案存取權」可以隨時改。
+#[derive(Clone)]
+struct FakeDevice {
+    access: std::rc::Rc<std::cell::Cell<bool>>,
+    /// 書齋要求打開設定頁幾次
+    requests: std::rc::Rc<std::cell::Cell<u32>>,
+}
+
+impl Default for FakeDevice {
+    fn default() -> Self {
+        FakeDevice { access: std::rc::Rc::new(std::cell::Cell::new(true)), requests: Default::default() }
+    }
+}
+
+impl Device for FakeDevice {
+    fn safe_insets(&self, _screen: egui::Vec2) -> [f32; 4] {
+        // 系統回報的是實體像素
+        [0.0, 0.0, 0.0, PHONE_NAV_BAR * PHONE_PPP]
+    }
+    fn has_all_files_access(&self) -> bool {
+        self.access.get()
+    }
+    fn request_all_files_access(&self) {
+        self.requests.set(self.requests.get() + 1);
+    }
+}
+
 /// 以手機版的介面把整個程式跑起來。
 struct Phone {
     ctx: egui::Context,
     app: ShosaiApp,
+    /// 假的手機：可以改它回報的權限，看書齋怎麼反應
+    device: FakeDevice,
     frame: eframe::Frame,
     textures: crate::shot::Textures,
     shapes: Vec<egui::epaint::ClippedShape>,
@@ -460,31 +489,21 @@ impl Phone {
         for book in ["雨夜的茶館", "星海航路"] {
             std::fs::create_dir_all(dir.join(book)).unwrap();
             for (file, title) in [("1.md", "第一章　出發"), ("2.md", "第二章　歸途")] {
-                let mut text = format!(
-                    "# {title}
-
-"
-                );
+                let mut text = format!("# {title}\n\n");
                 for i in 0..60 {
                     text.push_str(&"那一天的雨下得很久，他在窗邊等了一個下午。".repeat(1 + i % 3));
-                    text.push_str(
-                        "「還要多久？」她問，手裡的茶已經涼了。｜茶館《ちゃかん》裡只剩下他們兩個人。
-
-",
-                    );
+                    text.push_str("「還要多久？」她問，手裡的茶已經涼了。｜茶館《ちゃかん》裡只剩下他們兩個人。\n\n");
                 }
                 std::fs::write(dir.join(book).join(file), text).unwrap();
             }
         }
         let ctx = egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-        // 系統回報的範圍是實體像素
-        let content_rect: ContentRect =
-            Box::new(|| [0.0, 0.0, PHONE.x * PHONE_PPP, (PHONE.y - PHONE_NAV_BAR) * PHONE_PPP]);
+        let device = FakeDevice::default();
         let startup = Startup {
             library: Some(dir.clone()),
             mobile: true,
-            content_rect: Some(content_rect),
+            device: Some(Box::new(device.clone())),
             ..Default::default()
         };
         let mut app = ShosaiApp::new(&cc, startup);
@@ -495,6 +514,7 @@ impl Phone {
         let mut phone = Phone {
             ctx,
             app,
+            device,
             frame: eframe::Frame::_new_kittest(),
             textures: Default::default(),
             shapes: Vec::new(),
@@ -663,6 +683,41 @@ fn phone_picks_its_library_folder() {
     // 選的資料夾不見了（例如 Nextcloud 那邊刪掉了）：退回自動找到的
     std::fs::remove_dir_all(&chosen).unwrap();
     assert_eq!(relaunch(&saved), Some(library.clone()), "a picked library that is gone falls back to the found one");
+}
+
+/// 沒有「所有檔案存取權」時（Android 只讓書齋看到資料夾名稱、看不到裡面的文章）：
+/// 書櫃上方說明原因，按鈕打開設定頁；允許之後一回到書齋就重新讀書庫。
+#[test]
+fn phone_asks_for_file_access() {
+    let mut p = Phone::new("phone-access");
+    assert!(p.app.files_access.is_some_and(|(ok, _)| ok), "asked the device once at start");
+    p.device.access.set(false);
+    // 重新問一次（實際上是隔一秒自動再問）
+    p.app.files_access = None;
+    p.settle();
+    p.save("mobile-9-access.png");
+    p.tap(pos2(180.0, 423.0));
+    assert_eq!(p.device.requests.get(), 1, "the button opens the settings page");
+
+    // 沒權限時打開一本書：說明是權限的問題，而不是「沒有 Markdown 檔」
+    let empty = p.dir.join("看不到內容");
+    std::fs::create_dir_all(&empty).unwrap();
+    p.app.refresh();
+    p.app.open_novel(&empty, None);
+    assert!(
+        matches!(&p.app.status, Some(Status::Error(msg, _)) if msg.contains("所有檔案存取權")),
+        "explains why the book is empty"
+    );
+
+    // 使用者在設定頁允許了，回到書齋：重新讀書庫，新的書馬上出現
+    std::fs::create_dir_all(p.dir.join("新同步的書")).unwrap();
+    std::fs::write(p.dir.join("新同步的書/1.md"), "# 第一章\n\n內文。\n").unwrap();
+    p.device.access.set(true);
+    p.app.files_access = Some((false, Instant::now() - ACCESS_RECHECK));
+    p.settle();
+    assert!(p.app.files_access.is_some_and(|(ok, _)| ok));
+    let lib = p.app.library.as_ref().unwrap();
+    assert!(lib.entries.iter().any(|e| e.name == "新同步的書"), "the library was read again");
 }
 
 /// 放在記憶體裡的設定檔（測試「存起來、下次啟動再讀回來」）。

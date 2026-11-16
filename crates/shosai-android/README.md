@@ -2,24 +2,28 @@
 
 把桌面版同一份程式編成 APK，在手機上用書本模式看小說。目前只做閱讀，沒有編輯與 PDF 功能。
 
+程式本體是 Rust（`crates/shosai`）；`java/` 裡只有一個小小的 `ShosaiActivity`，
+做 Rust 這邊做不到的事：全螢幕（隱藏狀態列與導覽列、畫面延伸到前鏡頭旁邊），
+以及查詢、打開「所有檔案存取權」的設定頁。
+
 ## 需要的工具
 
 - Rust 的 Android 目標：`rustup target add aarch64-linux-android`
 - Android SDK（`build-tools`、一個 `platforms;android-NN`）與 NDK
 - [cargo-apk](https://github.com/rust-mobile/cargo-apk)：`cargo install cargo-apk --locked`
-- JDK（簽章用的 `keytool`、`apksigner` 需要）
+- JDK（編 `java/`、簽章用的 `keytool`、`apksigner` 都需要）
 
 ## 編譯
 
-在專案根目錄執行（PowerShell）：
+在專案根目錄執行：
 
 ```powershell
-$env:ANDROID_HOME = "$env:LOCALAPPDATA\Android\Sdk"
-$env:ANDROID_NDK_ROOT = "$env:ANDROID_HOME\ndk\27.3.13750724"
-$env:CARGO_APK_RELEASE_KEYSTORE = "$env:USERPROFILE\.android\debug.keystore"
-$env:CARGO_APK_RELEASE_KEYSTORE_PASSWORD = "android"
-cargo apk build -p shosai-android --release
+powershell -ExecutionPolicy Bypass -File crates\shosai-android\build.ps1
 ```
+
+腳本會先用 `cargo apk` 編 Rust 的部分，再把 `java/` 編成 `classes.dex` 加進 APK、重新簽章。
+**不要只跑 `cargo apk build`**：那樣的 APK 裡沒有 `ShosaiActivity`，一開啟就會結束。
+SDK、NDK 預設在 `%LOCALAPPDATA%\Android\Sdk`，放在別處的話先設定 `ANDROID_HOME`。
 
 成品在 `target/release/apk/shosai.apk`，複製到手機上點開就能安裝（第一次要允許「安裝不明應用程式」）。
 
@@ -35,8 +39,12 @@ keytool -genkey -v -keystore "$env:USERPROFILE\.android\debug.keystore" -storepa
 書庫是手機上的一個資料夾，裡面每個資料夾是一本書。
 
 **自己選**：在首頁（書櫃）按「選擇書庫資料夾…」，一層一層點進去，走到要當書庫的資料夾後按「用這個資料夾」。
-選過之後每次開啟都用它。要讀 App 自己以外的資料夾，得先到「設定 → 應用程式 → 書齋」
-（或「特殊存取權 → 所有檔案存取權」）允許書齋存取所有檔案，否則資料夾看起來會是空的。
+選過之後每次開啟都用它。
+
+**所有檔案存取權**：Android 只讓 App 看到其他 App（例如 Nextcloud）資料夾的**名稱**，
+看不到裡面的文章——書櫃上列得出書，點進去卻是空的。書齋沒有這個權限時，
+書櫃最上方會說明並提供「前往設定允許」按鈕；在設定頁打開「允許管理所有檔案」後回到書齋，
+書庫會自動重新讀一次。
 
 **沒選過的時候**，書齋依序找這兩個地方：
 
@@ -81,3 +89,4 @@ cargo test -p shosai mobile_shots -- --ignored   # 把幾個畫面存成 target/
 - 畫面閃退時看不到錯誤訊息；程式自己抓得到的錯誤會寫進書庫旁的 `crash.txt`，下次開啟時顯示
 - 閱讀進度只存在手機上
 - 介面還是桌面版的排法，按鈕偏小
+- 全螢幕時系統列藏起來了，從螢幕上緣或下緣往內滑會暫時出現

@@ -4572,6 +4572,7 @@ dependencies = [
  "egui_extras",
  "hayro",
  "image",
+ "jni",
  "notify",
  "rfd",
  "serde",
